@@ -65,8 +65,10 @@ configure. Use the `local` route and let Claude Code read the Vertex environment
 One-time setup:
 
 1. Enable Claude in Vertex Model Garden for your GCP project.
-2. Authenticate with `gcloud auth application-default login`, or point
-   `GOOGLE_APPLICATION_CREDENTIALS` at a service-account JSON.
+2. Authenticate with `gcloud auth application-default login`. deepsec relies on
+   Application Default Credentials from the well-known path (under `HOME`, or
+   `%APPDATA%` on Windows). It does not forward `GOOGLE_APPLICATION_CREDENTIALS`,
+   so a static service-account key file is not read from inside the agent.
 
 Run with the Vertex environment set:
 
@@ -85,9 +87,16 @@ Notes:
 - Claude is region-specific on Vertex, such as `us-east5`. Set
   `CLOUD_ML_REGION=global` if you hit 429s, and use `VERTEX_REGION_CLAUDE_*` for
   per-model region overrides.
-- deepsec forwards these variables (plus `GOOGLE_CLOUD_PROJECT`, `GCLOUD_PROJECT`,
-  and `CLOUDSDK_CONFIG`) to the spawned `claude` child. The env allowlist still
-  drops everything else.
+- Vertex applies to the `local` route only. If you select `--model-auth gateway`
+  or `direct`, deepsec clears `CLAUDE_CODE_USE_VERTEX` so the explicit provider is
+  used instead of an ambient Vertex setup.
+- deepsec forwards only the Vertex routing variables (`CLAUDE_CODE_USE_VERTEX`,
+  the project and region, the beta flag, and `VERTEX_REGION_CLAUDE_*`) to the
+  spawned `claude` child. It forwards no credential-file pointers, and the
+  allowlist drops everything else.
+- The agent reads untrusted repository code with shell and file tools, and it can
+  read the Application Default Credentials under `HOME`. Use a narrowly-scoped
+  identity for Vertex runs.
 
 ## CLI selection
 
