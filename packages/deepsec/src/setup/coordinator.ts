@@ -47,6 +47,7 @@ import {
   writeGeneratedMatchers,
 } from "./generated-matchers.js";
 import { ensureWorkspaceInstall, type SupportedPackageManager } from "./install.js";
+import { runOsvEnrich } from "./osv-enrich.js";
 import { SetupProtocolError } from "./protocol.js";
 import { phaseLabel, type SetupReporter } from "./reporter.js";
 import {
@@ -505,6 +506,9 @@ export async function runSetupWorkflow(
       )
     ) {
       const preserveInfo = infoIsComplete(infoPath) ? fs.readFileSync(infoPath, "utf8") : undefined;
+      // Run osv-scanner first so the threat model is written with known dependency
+      // CVEs in view (and persist them as a first-class osv-findings.json artifact).
+      const osvEnrichment = runOsvEnrich(projectRoot, projectDataDir);
       analysis = await runPhase(state, reporter, "info", infoInput, () =>
         services.analyze({
           projectId: options.projectId,
@@ -513,6 +517,7 @@ export async function runSetupWorkflow(
           agentConfig,
           signal: workflowSignal,
           onProgress: (progress) => reportAgentProgress(reporter, "info", progress),
+          dependencyContext: osvEnrichment.context,
         }),
       );
       writeRepositoryAnalysis(projectDataDir, analysis);
