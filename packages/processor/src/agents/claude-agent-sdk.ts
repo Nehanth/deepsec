@@ -144,6 +144,27 @@ export function buildClaudeEnv(): Record<string, string> {
     const v = process.env[k];
     if (typeof v === "string") env[k] = v;
   }
+  // Vertex routing: Claude Code reaches Claude-on-Vertex via GCP ADC (or a
+  // service-account file). Forward the vars it reads so they survive the minimal
+  // env. CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS is required on Vertex, which
+  // rejects the Anthropic beta headers the SDK adds by default.
+  for (const k of [
+    "CLAUDE_CODE_USE_VERTEX",
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "GOOGLE_CLOUD_PROJECT",
+    "GCLOUD_PROJECT",
+    "CLOUD_ML_REGION",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CLOUDSDK_CONFIG",
+    "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+  ]) {
+    const v = process.env[k];
+    if (typeof v === "string") env[k] = v;
+  }
+  // Per-model Vertex region overrides have dynamic names (VERTEX_REGION_CLAUDE_*).
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v === "string" && k.startsWith("VERTEX_REGION_CLAUDE_")) env[k] = v;
+  }
   // Gateway-bound runs carry the App Attribution headers via the CLI's
   // ANTHROPIC_CUSTOM_HEADERS (newline-separated `Name: Value` pairs).
   // The value is constructed here rather than allowlisted from
