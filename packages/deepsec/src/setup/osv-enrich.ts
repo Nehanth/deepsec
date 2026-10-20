@@ -31,6 +31,21 @@ export interface OsvEnrichment {
   hits: OsvPackageHit[];
 }
 
+/** Heading of the appended advisory section — shared so callers can locate/replace it. */
+export const OSV_CONTEXT_HEADING = "## Known-vulnerable dependencies (from osv-scanner)";
+
+/**
+ * Merge a preserved (possibly hand-edited) INFO.md with the current osv advisory
+ * section. Strips any previously appended section first, so refreshes don't
+ * accumulate duplicates or keep listing dependencies that have since been patched
+ * or removed. With no current advisories, the section is dropped entirely.
+ */
+export function mergeInfoWithOsvContext(preservedInfo: string, osvContext: string): string {
+  const idx = preservedInfo.indexOf(OSV_CONTEXT_HEADING);
+  const curated = (idx >= 0 ? preservedInfo.slice(0, idx) : preservedInfo).trimEnd();
+  return osvContext.trim() ? `${curated}\n\n${osvContext}\n` : `${curated}\n`;
+}
+
 // osv-scanner's recursive walk also descends into deepsec's own workspace and any
 // vendored trees, reporting their dependencies as the project's. Drop results
 // whose lockfile sits under one of these.
@@ -428,7 +443,7 @@ export function buildContext(hits: OsvPackageHit[]): string {
     return [`- \`${h.name}@${h.version}\`${marker}`, ...vulnLines].join("\n");
   });
   return [
-    "## Known-vulnerable dependencies (from osv-scanner)",
+    OSV_CONTEXT_HEADING,
     "",
     'These dependencies have published advisories (id followed by what the advisory is about). Rows marked "resolved range version" come from resolving a version range and may not be the installed version — treat them as applicable-if-resolved, not confirmed-present. In the Threat model and Project-specific patterns to flag sections, note where this codebase actually imports or calls each one, so the review can judge whether the advisory is reachable here rather than merely present.',
     "",

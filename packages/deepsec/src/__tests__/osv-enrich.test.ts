@@ -8,6 +8,8 @@ import {
   findManifests,
   findPom,
   manifestHasDirectRefs,
+  mergeInfoWithOsvContext,
+  OSV_CONTEXT_HEADING,
   parseOsv,
 } from "../setup/osv-enrich.js";
 
@@ -247,6 +249,31 @@ describe("buildContext resolved-version labeling", () => {
     });
     const hits = parseOsv(raw, new Set(["/tmp/x/requirements.txt"]));
     expect(hits[0].resolved).toBe(true);
+  });
+});
+
+describe("mergeInfoWithOsvContext (no stale-section accumulation)", () => {
+  const curated = "# proj\n\n## Threat model\ncurated content\n";
+  const sectionA = `${OSV_CONTEXT_HEADING}\n\n- \`starlette@0.46.0\`\n  - CVE-OLD`;
+  const sectionB = `${OSV_CONTEXT_HEADING}\n\n- \`anyio@4.0.0\`\n  - CVE-NEW`;
+
+  it("replaces a previously appended section rather than accumulating", () => {
+    const first = mergeInfoWithOsvContext(curated, sectionA);
+    const second = mergeInfoWithOsvContext(first, sectionB);
+    // exactly one advisory section, and it's the new one
+    expect(
+      second.match(new RegExp(OSV_CONTEXT_HEADING.replace(/[().]/g, "\\$&"), "g")),
+    ).toHaveLength(1);
+    expect(second).toContain("CVE-NEW");
+    expect(second).not.toContain("CVE-OLD");
+    expect(second).toContain("curated content"); // curated part preserved
+  });
+
+  it("drops the section entirely when there are no current advisories", () => {
+    const withSection = mergeInfoWithOsvContext(curated, sectionA);
+    const cleaned = mergeInfoWithOsvContext(withSection, "");
+    expect(cleaned).not.toContain(OSV_CONTEXT_HEADING);
+    expect(cleaned).toContain("curated content");
   });
 });
 

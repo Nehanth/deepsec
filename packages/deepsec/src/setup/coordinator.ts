@@ -47,7 +47,7 @@ import {
   writeGeneratedMatchers,
 } from "./generated-matchers.js";
 import { ensureWorkspaceInstall, type SupportedPackageManager } from "./install.js";
-import { runOsvEnrich } from "./osv-enrich.js";
+import { mergeInfoWithOsvContext, runOsvEnrich } from "./osv-enrich.js";
 import { SetupProtocolError } from "./protocol.js";
 import { phaseLabel, type SetupReporter } from "./reporter.js";
 import {
@@ -535,14 +535,12 @@ export async function runSetupWorkflow(
       );
       writeRepositoryAnalysis(projectDataDir, analysis);
       // Preserve a prior complete (possibly hand-edited) INFO.md so curated content
-      // isn't lost. When the osv step produced advisory context, append it to the
-      // preserved file instead of dropping either — the curated threat model stays,
-      // and matcher generation (which reads INFO.md) still sees the advisories.
+      // isn't lost, but keep the osv advisory section current: strip any previously
+      // appended section first, then append the freshly generated one (or none).
+      // Otherwise refreshes accumulate duplicate sections and keep listing
+      // dependencies that have since been patched or removed.
       if (preserveInfo) {
-        const merged = osvEnrichment.context
-          ? `${preserveInfo.trimEnd()}\n\n${osvEnrichment.context}\n`
-          : preserveInfo;
-        atomicWriteFileSync(infoPath, merged);
+        atomicWriteFileSync(infoPath, mergeInfoWithOsvContext(preserveInfo, osvEnrichment.context));
       }
       state.infoDigest = digest(fs.readFileSync(infoPath, "utf8"));
       state.inventoryDigest = digest(analysis.surfaces);
