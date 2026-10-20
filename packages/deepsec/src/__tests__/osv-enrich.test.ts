@@ -1,5 +1,8 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildContext, parseOsv } from "../setup/osv-enrich.js";
+import { buildContext, findManifest, parseOsv } from "../setup/osv-enrich.js";
 
 // osv-scanner's JSON groups packages under results[].packages[], each result
 // tagged with a source lockfile path, each package carrying vulnerabilities[]
@@ -55,6 +58,33 @@ describe("parseOsv", () => {
   it("returns nothing for empty or non-JSON output (osv missing / no sources)", () => {
     expect(parseOsv("")).toEqual([]);
     expect(parseOsv("No package sources found")).toEqual([]);
+  });
+});
+
+describe("findManifest", () => {
+  it("finds a nested pyproject.toml but skips vendored and hidden trees", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
+    try {
+      // A decoy inside a vendored tree must not be picked.
+      fs.mkdirSync(path.join(root, "node_modules", "dep"), { recursive: true });
+      fs.writeFileSync(path.join(root, "node_modules", "dep", "pyproject.toml"), "");
+      fs.mkdirSync(path.join(root, "src", "pkg"), { recursive: true });
+      const real = path.join(root, "src", "pkg", "pyproject.toml");
+      fs.writeFileSync(real, "[project]\nname='x'\n");
+
+      expect(findManifest(root)).toBe(real);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined when there is no manifest", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
+    try {
+      expect(findManifest(root)).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
