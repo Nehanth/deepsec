@@ -2,7 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildContext, findManifest, findManifests, parseOsv } from "../setup/osv-enrich.js";
+import {
+  buildContext,
+  findManifest,
+  findManifests,
+  findPom,
+  parseOsv,
+} from "../setup/osv-enrich.js";
 
 // osv-scanner's JSON groups packages under results[].packages[], each result
 // tagged with a source lockfile path, each package carrying vulnerabilities[]
@@ -59,32 +65,34 @@ describe("parseOsv", () => {
     expect(parseOsv("")).toEqual([]);
     expect(parseOsv("No package sources found")).toEqual([]);
   });
-});
 
-describe("findManifest", () => {
-  it("finds a nested pyproject.toml but skips vendored and hidden trees", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
-    try {
-      // A decoy inside a vendored tree must not be picked.
-      fs.mkdirSync(path.join(root, "node_modules", "dep"), { recursive: true });
-      fs.writeFileSync(path.join(root, "node_modules", "dep", "pyproject.toml"), "");
-      fs.mkdirSync(path.join(root, "src", "pkg"), { recursive: true });
-      const real = path.join(root, "src", "pkg", "pyproject.toml");
-      fs.writeFileSync(real, "[project]\nname='x'\n");
-
-      expect(findManifest(root)).toBe(real);
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it("returns undefined when there is no manifest", () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
-    try {
-      expect(findManifest(root)).toBeUndefined();
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+  it("dedupes a package seen from two sources, merging unique advisories", () => {
+    // Same Maven dep from osv's pom.xml parse AND the syft SBOM.
+    const raw = JSON.stringify({
+      results: [
+        {
+          source: { path: "pom.xml" },
+          packages: [
+            {
+              package: { name: "log4j-core", version: "2.14.1", ecosystem: "Maven" },
+              vulnerabilities: [{ id: "GHSA-jfh8-c2jp-5v3q" }],
+            },
+          ],
+        },
+        {
+          source: { path: "/tmp/x/deps.cdx.json" },
+          packages: [
+            {
+              package: { name: "log4j-core", version: "2.14.1", ecosystem: "Maven" },
+              vulnerabilities: [{ id: "GHSA-jfh8-c2jp-5v3q" }, { id: "GHSA-7rjr-3q55-vv33" }],
+            },
+          ],
+        },
+      ],
+    });
+    const hits = parseOsv(raw);
+    expect(hits).toHaveLength(1);
+    expect(hits[0].vulns.map((v) => v.id)).toEqual(["GHSA-jfh8-c2jp-5v3q", "GHSA-7rjr-3q55-vv33"]);
   });
 });
 
@@ -118,6 +126,33 @@ describe("parseOsv field sanitization (prompt-injection defense)", () => {
   });
 });
 
+describe("findManifest", () => {
+  it("finds a nested pyproject.toml but skips vendored and hidden trees", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
+    try {
+      // A decoy inside a vendored tree must not be picked.
+      fs.mkdirSync(path.join(root, "node_modules", "dep"), { recursive: true });
+      fs.writeFileSync(path.join(root, "node_modules", "dep", "pyproject.toml"), "");
+      fs.mkdirSync(path.join(root, "src", "pkg"), { recursive: true });
+      const real = path.join(root, "src", "pkg", "pyproject.toml");
+      fs.writeFileSync(real, "[project]\nname='x'\n");
+
+      expect(findManifest(root)).toBe(real);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined when there is no manifest", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
+    try {
+      expect(findManifest(root)).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("findManifests (monorepo)", () => {
   it("returns every pyproject.toml, not just the first", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-multi-"));
@@ -129,6 +164,32 @@ describe("findManifests (monorepo)", () => {
       const found = findManifests(root);
       expect(found).toHaveLength(2);
       expect(findManifest(root)).toBe(found[0]); // single-use helper returns the first
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("findPom", () => {
+  it("finds a nested pom.xml but skips vendored trees", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-pom-"));
+    try {
+      fs.mkdirSync(path.join(root, "vendor", "lib"), { recursive: true });
+      fs.writeFileSync(path.join(root, "vendor", "lib", "pom.xml"), "");
+      fs.mkdirSync(path.join(root, "server"), { recursive: true });
+      const real = path.join(root, "server", "pom.xml");
+      fs.writeFileSync(real, "<project></project>\n");
+
+      expect(findPom(root)).toBe(real);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("returns undefined when there is no pom", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-pom-"));
+    try {
+      expect(findPom(root)).toBeUndefined();
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

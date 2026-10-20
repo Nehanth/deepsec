@@ -33,7 +33,7 @@ const MAX_SUMMARY_LENGTH = 160;
 // to block newline/markdown prompt injection.
 const MAX_NAME_LENGTH = 120;
 const MAX_VERSION_LENGTH = 60;
-// uv/osv-scanner reach the network; give them room but never hang setup.
+// uv/syft/osv-scanner reach the network; give them room but never hang setup.
 const RESOLVE_TIMEOUT_MS = 120_000;
 const OSV_TIMEOUT_MS = 120_000;
 // How far below the root to look for dependency manifests.
@@ -50,6 +50,13 @@ interface ResolvedLockfile {
   /** osv-scanner --lockfile spec, e.g. "requirements.txt:/tmp/.../requirements.txt". */
   spec: string;
   /** Temp dir holding the resolved lockfile, removed once osv-scanner has read it. */
+  tempDir: string;
+}
+
+interface JavaSbom {
+  /** CycloneDX SBOM file for osv-scanner to scan (auto-detected by the .cdx.json name). */
+  path: string;
+  /** Temp dir holding the SBOM, removed once osv-scanner has read it. */
   tempDir: string;
 }
 
@@ -70,12 +77,9 @@ function sanitizeField(text: string | undefined, maxLength: number): string {
   return oneLine.length > maxLength ? `${oneLine.slice(0, maxLength - 1)}…` : oneLine;
 }
 
-/**
- * Collect every dependency manifest (pyproject.toml) near the root, skipping
- * vendored and hidden trees. A monorepo can declare several range-only packages;
- * each one needs floor resolution or its CVEs are silently missed.
- */
-export function findManifests(projectRoot: string): string[] {
+/** Breadth-first walk from the root collecting every file named `filename`, skipping
+ * vendored and hidden trees. */
+function collectFiles(projectRoot: string, filename: string): string[] {
   const found: string[] = [];
   const queue: Array<{ dir: string; depth: number }> = [{ dir: projectRoot, depth: 0 }];
   while (queue.length > 0) {
@@ -87,7 +91,7 @@ export function findManifests(projectRoot: string): string[] {
       continue;
     }
     for (const entry of entries) {
-      if (entry.isFile() && entry.name === "pyproject.toml") found.push(path.join(dir, entry.name));
+      if (entry.isFile() && entry.name === filename) found.push(path.join(dir, entry.name));
     }
     if (depth < MANIFEST_SCAN_DEPTH) {
       for (const entry of entries) {
@@ -105,9 +109,23 @@ export function findManifests(projectRoot: string): string[] {
   return found;
 }
 
-/** First manifest near the root (kept for callers that only need one). */
+/**
+ * Collect every Python dependency manifest (pyproject.toml) near the root. A
+ * monorepo can declare several range-only packages; each one needs floor
+ * resolution or its CVEs are silently missed.
+ */
+export function findManifests(projectRoot: string): string[] {
+  return collectFiles(projectRoot, "pyproject.toml");
+}
+
+/** First Python manifest near the root (kept for callers that only need one). */
 export function findManifest(projectRoot: string): string | undefined {
   return findManifests(projectRoot)[0];
+}
+
+/** First Maven project file (pom.xml) near the root. */
+export function findPom(projectRoot: string): string | undefined {
+  return collectFiles(projectRoot, "pom.xml")[0];
 }
 
 function hasPythonLockfile(dir: string): boolean {
@@ -115,15 +133,14 @@ function hasPythonLockfile(dir: string): boolean {
 }
 
 /**
- * Resolve one manifest at one resolution end into a temp requirements lockfile.
+ * Resolve one Python manifest at one resolution end into a temp requirements lockfile.
  *
  * uv is run with hardening because the manifest is repository-controlled and
  * resolving it is otherwise arbitrary code execution: `--no-build` blocks PEP 517
  * build hooks and dynamic-metadata project builds, `--no-sources` ignores
  * attacker-controlled `[tool.uv.sources]` (custom index/git/path), and cwd is an
  * empty temp dir so no `uv.toml`/`[tool.uv]` from the project tree is honored.
- * The compile still uses the public index to resolve versions but never executes
- * repo code. Returns undefined (degrading to the source walk) on any failure.
+ * Returns undefined (degrading to the source walk) on any failure.
  */
 function resolveOne(
   manifest: string,
@@ -164,11 +181,10 @@ function resolveOne(
 }
 
 /**
- * Many source packages declare dependency *ranges* in a manifest, not a pinned
- * lockfile, so osv-scanner reports "no package sources" and misses every
- * dependency CVE. For each manifest that has no real lockfile, resolve both the
- * lowest and highest allowed versions and hand osv-scanner the resolved
- * lockfiles. Returns the specs to scan, or [] when nothing can be resolved.
+ * Python packages often declare dependency *ranges* with no lockfile, so
+ * osv-scanner reports "no package sources" and misses every dependency CVE. For
+ * each manifest that has no real lockfile, resolve both the lowest and highest
+ * allowed versions and hand osv-scanner the resolved lockfiles.
  */
 function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): ResolvedLockfile[] {
   if (!toolExists("uv")) return [];
@@ -185,6 +201,50 @@ function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): Res
     }
   });
   return resolved;
+}
+
+/**
+ * Maven/Java packages usually pin dependency versions, but osv-scanner can't read
+ * a bare pom.xml ("no package sources"). syft resolves the Maven project into a
+ * CycloneDX SBOM, which osv-scanner then matches against advisories. syft only
+ * catalogs (it does not build or execute project code). Excludes mirror the
+ * vendored-tree filter; a copy of the SBOM is kept as evidence. Returns undefined
+ * (degrading to the source walk) when there is no pom, syft is missing, or it fails.
+ */
+function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom | undefined {
+  if (!findPom(projectRoot) || !toolExists("syft")) return undefined;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-sbom-"));
+  const sbom = path.join(tempDir, "deps.cdx.json");
+  try {
+    execFileSync(
+      "syft",
+      [
+        `dir:${path.resolve(projectRoot)}`,
+        "--exclude",
+        "./vendor/**",
+        "--exclude",
+        "./node_modules/**",
+        "--exclude",
+        "./third_party/**",
+        "--exclude",
+        "./.deepsec/**",
+        "-q",
+        "-o",
+        `cyclonedx-json=${sbom}`,
+      ],
+      { stdio: ["ignore", "ignore", "ignore"], timeout: RESOLVE_TIMEOUT_MS },
+    );
+    if (!fs.existsSync(sbom)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return undefined;
+    }
+    fs.mkdirSync(projectDataDir, { recursive: true });
+    fs.copyFileSync(sbom, path.join(projectDataDir, "deps-sbom.cdx.json"));
+    return { path: sbom, tempDir };
+  } catch {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    return undefined;
+  }
 }
 
 /**
@@ -209,12 +269,16 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
     return { context: "", hits: [] };
   }
   const resolved = resolveFloorLockfiles(projectRoot, projectDataDir);
+  const javaSbom = resolveJavaSbom(projectRoot, projectDataDir);
   let raw = "";
   try {
     const args = ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)];
     // Scan any resolved floor lockfiles alongside the recursive source walk, so
     // range-only manifests surface their applicable dependency CVEs.
     for (const lockfile of resolved) args.push(`--lockfile=${lockfile.spec}`);
+    // A Maven project's SBOM (from syft) carries the Java deps osv-scanner can't
+    // read from a bare pom.xml; it is auto-detected by its .cdx.json name.
+    if (javaSbom) args.push(javaSbom.path);
     raw = execFileSync("osv-scanner", args, {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
@@ -228,6 +292,7 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
     for (const lockfile of resolved) {
       fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
     }
+    if (javaSbom) fs.rmSync(javaSbom.tempDir, { recursive: true, force: true });
   }
   const hits = parseOsv(raw);
   fs.mkdirSync(projectDataDir, { recursive: true });
