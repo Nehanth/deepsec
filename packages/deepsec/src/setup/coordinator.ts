@@ -463,6 +463,10 @@ export async function runSetupWorkflow(
     const loaded = await loadConfig(workspaceDir);
     if (!loaded) throw new Error(`Could not load ${path.join(workspaceDir, "deepsec.config.ts")}`);
 
+    // Dependency-CVE enrichment is opt-in (it runs external, network-reaching tools):
+    // enabled per-project with `osv: true` in deepsec.config.ts. Off by default.
+    const osvEnabled = loaded.config.projects.find((p) => p.id === options.projectId)?.osv === true;
+
     const loginInput = digest({
       route,
       agentType,
@@ -507,9 +511,11 @@ export async function runSetupWorkflow(
       agentType,
       model,
       thinkingLevel,
-      // Bumped to 3 for the osv dependency-CVE enrichment: invalidates pre-upgrade
-      // info checkpoints so existing projects re-run and gain dependency findings.
-      rubricVersion: 3,
+      rubricVersion: 2,
+      // Only enabling osv invalidates the info checkpoint (forcing one re-run to
+      // adopt the enrichment). Projects that never enable it keep the prior digest
+      // and are not re-run unnecessarily.
+      ...(osvEnabled ? { osv: true } : {}),
     });
     if (
       !analysis ||
@@ -519,9 +525,11 @@ export async function runSetupWorkflow(
       )
     ) {
       const preserveInfo = infoIsComplete(infoPath) ? fs.readFileSync(infoPath, "utf8") : undefined;
-      // Run osv-scanner first so the threat model is written with known dependency
-      // CVEs in view (and persist them as a first-class osv-findings.json artifact).
-      const osvEnrichment = runOsvEnrich(projectRoot, projectDataDir);
+      // Run osv-scanner first (when enabled) so the threat model is written with
+      // known dependency CVEs in view (persisted as the osv-findings.json artifact).
+      const osvEnrichment = osvEnabled
+        ? runOsvEnrich(projectRoot, projectDataDir)
+        : { context: "", hits: [] };
       analysis = await runPhase(state, reporter, "info", infoInput, () =>
         services.analyze({
           projectId: options.projectId,
@@ -647,12 +655,12 @@ export async function runSetupWorkflow(
     // whose code isn't an uncovered surface still needs a matcher, so run one pass.
     const threatModel = fs.existsSync(infoPath) ? fs.readFileSync(infoPath, "utf8") : undefined;
     const dependencyCveCount = readOsvFindingCount(projectDataDir);
-    const hasDepCves = dependencyCveCount > 0;
+    const hasDepCves = osvEnabled && dependencyCveCount > 0;
 
     // Run the dependency-CVE matcher pass once, tracked by its own flag (not the
     // append-only matcherAttempts history): this both avoids repeating it on every
-    // resume AND ensures upgraded projects — which may already have older matcher
-    // attempts — still get it after the rubricVersion bump re-enriches the threat model.
+    // resume AND ensures a project that only just enabled osv still gets it even if
+    // it already has older matcher attempts from before.
     const depCveFirstPass = hasDepCves && !state.osvMatcherPassDone;
     if (depCveFirstPass) {
       state.osvMatcherPassDone = true;
