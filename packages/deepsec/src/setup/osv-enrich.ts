@@ -40,11 +40,9 @@ interface ResolvedLockfile {
   tempDir: string;
 }
 
-/**
- * Find a dependency manifest (currently pyproject.toml) near the root, skipping
- * vendored and hidden trees.
- */
-export function findManifest(projectRoot: string): string | undefined {
+/** Breadth-first walk from the root for the first file named `filename`, skipping
+ * vendored and hidden trees. */
+function findFileNear(projectRoot: string, filename: string): string | undefined {
   const queue: Array<{ dir: string; depth: number }> = [{ dir: projectRoot, depth: 0 }];
   while (queue.length > 0) {
     const { dir, depth } = queue.shift() as { dir: string; depth: number };
@@ -55,7 +53,7 @@ export function findManifest(projectRoot: string): string | undefined {
       continue;
     }
     for (const entry of entries) {
-      if (entry.isFile() && entry.name === "pyproject.toml") return path.join(dir, entry.name);
+      if (entry.isFile() && entry.name === filename) return path.join(dir, entry.name);
     }
     if (depth < MANIFEST_SCAN_DEPTH) {
       for (const entry of entries) {
@@ -71,6 +69,16 @@ export function findManifest(projectRoot: string): string | undefined {
     }
   }
   return undefined;
+}
+
+/** Find a Python dependency manifest (pyproject.toml) near the root. */
+export function findManifest(projectRoot: string): string | undefined {
+  return findFileNear(projectRoot, "pyproject.toml");
+}
+
+/** Find a Maven project file (pom.xml) near the root. */
+export function findPom(projectRoot: string): string | undefined {
+  return findFileNear(projectRoot, "pom.xml");
 }
 
 /**
@@ -110,6 +118,59 @@ function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): Res
   }
 }
 
+interface JavaSbom {
+  /** CycloneDX SBOM file for osv-scanner to scan (auto-detected by the .cdx.json name). */
+  path: string;
+  /** Temp dir holding the SBOM, removed once osv-scanner has read it. */
+  tempDir: string;
+}
+
+/**
+ * Maven/Java packages usually pin dependency versions (no ranges to floor-
+ * resolve), but osv-scanner can't read a bare pom.xml ("no package sources").
+ * Mirror Traust's SBOM step: syft resolves the Maven project into a CycloneDX
+ * SBOM, which osv-scanner then matches against advisories. Excludes mirror the
+ * vendored-tree filter. A copy of the SBOM is kept as evidence.
+ *
+ * Degrades cleanly: no pom, syft missing, or syft fails → undefined, and the
+ * scan falls back to the source walk unchanged.
+ */
+function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom | undefined {
+  if (!findPom(projectRoot)) return undefined;
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-sbom-"));
+  const sbom = path.join(tempDir, "deps.cdx.json");
+  try {
+    execFileSync(
+      "syft",
+      [
+        `dir:${path.resolve(projectRoot)}`,
+        "--exclude",
+        "./vendor/**",
+        "--exclude",
+        "./node_modules/**",
+        "--exclude",
+        "./third_party/**",
+        "--exclude",
+        "./.deepsec/**",
+        "-q",
+        "-o",
+        `cyclonedx-json=${sbom}`,
+      ],
+      { stdio: ["ignore", "ignore", "ignore"], timeout: RESOLVE_TIMEOUT_MS },
+    );
+    if (!fs.existsSync(sbom)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return undefined;
+    }
+    fs.mkdirSync(projectDataDir, { recursive: true });
+    fs.copyFileSync(sbom, path.join(projectDataDir, "deps-sbom.cdx.json"));
+    return { path: sbom, tempDir };
+  } catch {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    return undefined;
+  }
+}
+
 /**
  * Run osv-scanner over the project's dependency manifests, persist the result to
  * osv-findings.json, and return a markdown summary of known-vulnerable
@@ -122,12 +183,16 @@ function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): Res
  */
 export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEnrichment {
   const resolved = resolveFloorLockfiles(projectRoot, projectDataDir);
+  const javaSbom = resolveJavaSbom(projectRoot, projectDataDir);
   let raw = "";
   try {
     const args = ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)];
     // Scan any resolved floor lockfiles alongside the recursive source walk, so
     // range-only manifests surface their applicable dependency CVEs.
     for (const lockfile of resolved) args.push(`--lockfile=${lockfile.spec}`);
+    // A Maven project's SBOM (from syft) carries the Java deps osv-scanner can't
+    // read from a bare pom.xml; it is auto-detected by its .cdx.json name.
+    if (javaSbom) args.push(javaSbom.path);
     raw = execFileSync("osv-scanner", args, {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
@@ -140,6 +205,7 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
     for (const lockfile of resolved) {
       fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
     }
+    if (javaSbom) fs.rmSync(javaSbom.tempDir, { recursive: true, force: true });
   }
   const hits = parseOsv(raw);
   fs.mkdirSync(projectDataDir, { recursive: true });
@@ -158,7 +224,10 @@ export function parseOsv(raw: string): OsvPackageHit[] {
   } catch {
     return [];
   }
-  const hits: OsvPackageHit[] = [];
+  // The same dependency can surface from more than one source — e.g. osv-scanner
+  // parses a simple pom.xml during the recursive walk AND the syft SBOM catches
+  // it too. Dedupe by name@version@ecosystem, merging advisories (unique by id).
+  const byPackage = new Map<string, OsvPackageHit>();
   for (const result of (data.results ?? []) as Array<{
     source?: { path?: string };
     packages?: unknown[];
@@ -173,15 +242,19 @@ export function parseOsv(raw: string): OsvPackageHit[] {
         .map((v) => ({ id: v.id, summary: shortSummary(v.summary ?? v.details) }));
       if (vulns.length === 0) continue;
       const info = pkg.package ?? {};
-      hits.push({
-        name: info.name ?? "unknown",
-        version: info.version ?? "unknown",
-        ecosystem: info.ecosystem,
-        vulns,
-      });
+      const name = info.name ?? "unknown";
+      const version = info.version ?? "unknown";
+      const key = `${name}@${version}@${info.ecosystem ?? ""}`;
+      const existing = byPackage.get(key);
+      if (existing) {
+        const seen = new Set(existing.vulns.map((v) => v.id));
+        for (const v of vulns) if (!seen.has(v.id)) existing.vulns.push(v);
+      } else {
+        byPackage.set(key, { name, version, ecosystem: info.ecosystem, vulns });
+      }
     }
   }
-  return hits;
+  return [...byPackage.values()];
 }
 
 function shortSummary(text: string | undefined): string | undefined {
