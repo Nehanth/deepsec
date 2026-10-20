@@ -507,7 +507,9 @@ export async function runSetupWorkflow(
       agentType,
       model,
       thinkingLevel,
-      rubricVersion: 2,
+      // Bumped to 3 for the osv dependency-CVE enrichment: invalidates pre-upgrade
+      // info checkpoints so existing projects re-run and gain dependency findings.
+      rubricVersion: 3,
     });
     if (
       !analysis ||
@@ -532,7 +534,10 @@ export async function runSetupWorkflow(
         }),
       );
       writeRepositoryAnalysis(projectDataDir, analysis);
-      if (preserveInfo) atomicWriteFileSync(infoPath, preserveInfo);
+      // Preserve a prior complete (possibly hand-edited) INFO.md — but NOT when the
+      // osv step injected dependency CVEs, or restoring the old file would discard
+      // the advisory-reachability analysis that matcher generation later reads.
+      if (preserveInfo && !osvEnrichment.context) atomicWriteFileSync(infoPath, preserveInfo);
       state.infoDigest = digest(fs.readFileSync(infoPath, "utf8"));
       state.inventoryDigest = digest(analysis.surfaces);
       writeSetupState(state);
@@ -640,10 +645,14 @@ export async function runSetupWorkflow(
     const dependencyCveCount = readOsvFindingCount(projectDataDir);
     const hasDepCves = dependencyCveCount > 0;
 
+    // Run the dependency-CVE matcher pass once (on first-ever matcher generation),
+    // not on every resume — otherwise each resumed setup re-spends agent/scan work
+    // and accumulates duplicate matchers under new slugs.
+    const depCveFirstPass = hasDepCves && state.matcherAttempts.length === 0;
     const maxAttempts = 2;
     for (
       let attempt = 0;
-      attempt < maxAttempts && (!coverage.passed || (hasDepCves && attempt === 0));
+      attempt < maxAttempts && (!coverage.passed || (depCveFirstPass && attempt === 0));
       attempt++
     ) {
       reporter.emit({

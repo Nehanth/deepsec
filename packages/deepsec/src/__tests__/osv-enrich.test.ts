@@ -2,7 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildContext, findManifest, findPom, parseOsv } from "../setup/osv-enrich.js";
+import {
+  buildContext,
+  findManifest,
+  findManifests,
+  findPom,
+  parseOsv,
+} from "../setup/osv-enrich.js";
 
 // osv-scanner's JSON groups packages under results[].packages[], each result
 // tagged with a source lockfile path, each package carrying vulnerabilities[]
@@ -90,6 +96,36 @@ describe("parseOsv", () => {
   });
 });
 
+describe("parseOsv field sanitization (prompt-injection defense)", () => {
+  it("collapses newlines/markdown in attacker-controlled name and version", () => {
+    const raw = JSON.stringify({
+      results: [
+        {
+          source: { path: "requirements.txt" },
+          packages: [
+            {
+              package: {
+                name: "evil\n## Injected heading\n- bullet",
+                version: "1.0\n\nmore",
+                ecosystem: "PyPI",
+              },
+              vulnerabilities: [{ id: "CVE-1", summary: "x" }],
+            },
+          ],
+        },
+      ],
+    });
+    const hits = parseOsv(raw);
+    expect(hits).toHaveLength(1);
+    expect(hits[0].name).not.toContain("\n");
+    expect(hits[0].version).not.toContain("\n");
+    // and the rendered prompt block carries no injected newlines from those fields
+    const ctx = buildContext(hits);
+    expect(ctx).toContain("Injected heading"); // present, but inline — not a real heading
+    expect(ctx).not.toMatch(/\n##? Injected heading/);
+  });
+});
+
 describe("findManifest", () => {
   it("finds a nested pyproject.toml but skips vendored and hidden trees", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
@@ -111,6 +147,23 @@ describe("findManifest", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-manifest-"));
     try {
       expect(findManifest(root)).toBeUndefined();
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("findManifests (monorepo)", () => {
+  it("returns every pyproject.toml, not just the first", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-multi-"));
+    try {
+      fs.mkdirSync(path.join(root, "pkg-a"), { recursive: true });
+      fs.mkdirSync(path.join(root, "pkg-b"), { recursive: true });
+      fs.writeFileSync(path.join(root, "pkg-a", "pyproject.toml"), "");
+      fs.writeFileSync(path.join(root, "pkg-b", "pyproject.toml"), "");
+      const found = findManifests(root);
+      expect(found).toHaveLength(2);
+      expect(findManifest(root)).toBe(found[0]); // single-use helper returns the first
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
