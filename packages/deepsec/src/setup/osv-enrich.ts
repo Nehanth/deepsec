@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { atomicWriteFileSync } from "../atomic-file.js";
 
@@ -27,6 +28,87 @@ export interface OsvEnrichment {
 // whose lockfile sits under one of these.
 const VENDORED_SOURCE = /(^|\/)(\.deepsec|node_modules|vendor)(\/|$)/;
 const MAX_SUMMARY_LENGTH = 160;
+// uv reaches the index to resolve a manifest; give it room but don't hang setup.
+const RESOLVE_TIMEOUT_MS = 120_000;
+// How far below the root to look for a dependency manifest.
+const MANIFEST_SCAN_DEPTH = 3;
+
+interface ResolvedLockfile {
+  /** osv-scanner --lockfile spec, e.g. "requirements.txt:/tmp/.../requirements.txt". */
+  spec: string;
+  /** Temp dir holding the resolved lockfile, removed once osv-scanner has read it. */
+  tempDir: string;
+}
+
+/**
+ * Find a dependency manifest (currently pyproject.toml) near the root, skipping
+ * vendored and hidden trees.
+ */
+export function findManifest(projectRoot: string): string | undefined {
+  const queue: Array<{ dir: string; depth: number }> = [{ dir: projectRoot, depth: 0 }];
+  while (queue.length > 0) {
+    const { dir, depth } = queue.shift() as { dir: string; depth: number };
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name === "pyproject.toml") return path.join(dir, entry.name);
+    }
+    if (depth < MANIFEST_SCAN_DEPTH) {
+      for (const entry of entries) {
+        if (
+          entry.isDirectory() &&
+          !entry.name.startsWith(".") &&
+          entry.name !== "node_modules" &&
+          entry.name !== "vendor"
+        ) {
+          queue.push({ dir: path.join(dir, entry.name), depth: depth + 1 });
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Many source packages declare dependency *ranges* in a manifest, not a pinned
+ * lockfile, so osv-scanner reports "no package sources" and misses every
+ * dependency CVE. Resolve the manifest to its lowest allowed versions — the
+ * worst-case / applicable-CVE floor (a `>=` constraint permits a build to land
+ * on that floor) — and hand osv-scanner the resolved lockfile.
+ *
+ * The lockfile goes in a temp dir (not projectDataDir) so its osv source path is
+ * not mistaken for a vendored tree; a copy is kept as deps-lowest.txt evidence.
+ * Returns the specs to pass to osv-scanner, or [] when nothing can be resolved.
+ */
+function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): ResolvedLockfile[] {
+  const manifest = findManifest(projectRoot);
+  if (!manifest) return [];
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-osv-"));
+  const lockfile = path.join(tempDir, "requirements.txt");
+  try {
+    execFileSync(
+      "uv",
+      ["pip", "compile", manifest, "--resolution", "lowest", "-o", lockfile, "-q"],
+      { stdio: ["ignore", "ignore", "ignore"], timeout: RESOLVE_TIMEOUT_MS },
+    );
+    if (!fs.existsSync(lockfile)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      return [];
+    }
+    // Keep the resolved floor as evidence alongside osv-findings.json.
+    fs.mkdirSync(projectDataDir, { recursive: true });
+    fs.copyFileSync(lockfile, path.join(projectDataDir, "deps-lowest.txt"));
+    return [{ spec: `requirements.txt:${lockfile}`, tempDir }];
+  } catch {
+    // uv missing, manifest unresolvable, or timed out: fall back to source scan.
+    fs.rmSync(tempDir, { recursive: true, force: true });
+    return [];
+  }
+}
 
 /**
  * Run osv-scanner over the project's dependency manifests, persist the result to
@@ -39,16 +121,25 @@ const MAX_SUMMARY_LENGTH = 160;
  * JSON is read off stdout regardless of exit code.)
  */
 export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEnrichment {
+  const resolved = resolveFloorLockfiles(projectRoot, projectDataDir);
   let raw = "";
   try {
-    raw = execFileSync(
-      "osv-scanner",
-      ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)],
-      { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] },
-    );
+    const args = ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)];
+    // Scan any resolved floor lockfiles alongside the recursive source walk, so
+    // range-only manifests surface their applicable dependency CVEs.
+    for (const lockfile of resolved) args.push(`--lockfile=${lockfile.spec}`);
+    raw = execFileSync("osv-scanner", args, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
   } catch (error) {
     const stdout = (error as { stdout?: unknown })?.stdout;
     raw = typeof stdout === "string" ? stdout : "";
+  } finally {
+    for (const lockfile of resolved) {
+      fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
+    }
   }
   const hits = parseOsv(raw);
   fs.mkdirSync(projectDataDir, { recursive: true });
