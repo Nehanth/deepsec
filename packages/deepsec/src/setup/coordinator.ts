@@ -279,6 +279,17 @@ function previousConnection(state: SetupState): Record<string, unknown> | undefi
   return state.connection && typeof state.connection === "object" ? state.connection : undefined;
 }
 
+/** Count the known-vulnerable dependencies the osv step persisted, 0 if none/absent. */
+function readOsvFindingCount(projectDataDir: string): number {
+  try {
+    const raw = fs.readFileSync(path.join(projectDataDir, "osv-findings.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.length : 0;
+  } catch {
+    return 0;
+  }
+}
+
 function installFingerprint(workspaceDir: string): string {
   const manifest = fs.readFileSync(path.join(workspaceDir, "package.json"), "utf8");
   let localArtifacts: string | undefined;
@@ -621,8 +632,20 @@ export async function runSetupWorkflow(
     state.coverageReport = coverage;
     writeSetupState(state);
 
+    // Known-vulnerable dependencies (from the osv step) steer matcher generation
+    // toward the reachable advisories' call sites. When every surface is already
+    // covered, matcher generation would normally be skipped — but a dependency CVE
+    // whose code isn't an uncovered surface still needs a matcher, so run one pass.
+    const threatModel = fs.existsSync(infoPath) ? fs.readFileSync(infoPath, "utf8") : undefined;
+    const dependencyCveCount = readOsvFindingCount(projectDataDir);
+    const hasDepCves = dependencyCveCount > 0;
+
     const maxAttempts = 2;
-    for (let attempt = 0; !coverage.passed && attempt < maxAttempts; attempt++) {
+    for (
+      let attempt = 0;
+      attempt < maxAttempts && (!coverage.passed || (hasDepCves && attempt === 0));
+      attempt++
+    ) {
       reporter.emit({
         type: "progress",
         phase: "matchers",
@@ -653,6 +676,8 @@ export async function runSetupWorkflow(
             inventory: expanded.items,
             coverage,
             existingSlugs: [...new Set(existingSlugs)],
+            threatModel,
+            dependencyCveCount,
             signal: workflowSignal,
             onProgress: (progress) => reportAgentProgress(reporter, "matchers", progress),
           }),
