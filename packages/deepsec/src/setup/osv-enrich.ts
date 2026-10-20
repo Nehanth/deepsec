@@ -15,6 +15,14 @@ export interface OsvPackageHit {
   version: string;
   ecosystem?: string;
   vulns: OsvVuln[];
+  /**
+   * True when the version came from a *resolved* floor/ceiling lockfile (uv),
+   * not an installed/declared one — i.e. a hypothetical version the range allows,
+   * so advisories against it are "applicable if the range resolves there", not
+   * confirmed-present. Rendered distinctly so the review doesn't treat an
+   * up-to-date project as actually vulnerable.
+   */
+  resolved?: boolean;
 }
 
 export interface OsvEnrichment {
@@ -29,34 +37,43 @@ export interface OsvEnrichment {
 const VENDORED_SOURCE = /(^|\/)(\.deepsec|node_modules|vendor)(\/|$)/;
 const MAX_SUMMARY_LENGTH = 160;
 // Package name/version come from repo-controlled lockfiles and are interpolated
-// into the threat-model prompt, so they are collapsed and clamped like summaries
-// to block newline/markdown prompt injection.
+// into the threat-model prompt, so they are collapsed and clamped to block
+// newline/markdown prompt injection.
 const MAX_NAME_LENGTH = 120;
 const MAX_VERSION_LENGTH = 60;
-// uv/syft/osv-scanner reach the network; give them room but never hang setup.
+// Per-subprocess and overall network budgets — these run synchronously, so bound
+// the total time rather than relying on an abort signal a blocked call can't see.
 const RESOLVE_TIMEOUT_MS = 120_000;
 const OSV_TIMEOUT_MS = 120_000;
+const OVERALL_RESOLVE_BUDGET_MS = 300_000;
+// Cap manifests resolved so a large monorepo can't stall setup for many minutes.
+const MAX_MANIFESTS = 10;
 // How far below the root to look for dependency manifests.
 const MANIFEST_SCAN_DEPTH = 3;
 // Range resolution ends: lowest = worst-case/applicable floor, highest = "safe if
 // installed today". Scanning both widens coverage of versions the range permits.
 const UV_RESOLUTIONS = ["lowest", "highest"] as const;
-// A real lockfile next to the manifest means the installed versions are known;
-// osv-scanner's recursive walk reads it directly, so skip floor resolution (which
-// would otherwise flag hypothetical versions that are not actually installed).
-const PYTHON_LOCKFILES = ["uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock", "requirements.txt"];
+// Pinned lockfiles next to the manifest mean the installed versions are known;
+// osv-scanner's recursive walk reads them directly, so skip floor resolution.
+// requirements.txt is intentionally excluded — it is often unpinned (ranges), so
+// treating it as authoritative would skip resolution and miss those CVEs.
+const PYTHON_LOCKFILES = ["uv.lock", "poetry.lock", "Pipfile.lock", "pdm.lock"];
+// PEP 508 direct references (`name @ url`, VCS, local path). Resolving a manifest
+// that contains these makes uv fetch attacker-chosen URLs → SSRF, so such
+// manifests are skipped rather than resolved.
+const DIRECT_REF = /@\s*(https?:\/\/|git\+|hg\+|bzr\+|svn\+|file:|ssh:)/i;
 
 interface ResolvedLockfile {
   /** osv-scanner --lockfile spec, e.g. "requirements.txt:/tmp/.../requirements.txt". */
   spec: string;
+  /** Absolute path osv-scanner will report as the result source. */
+  sourcePath: string;
   /** Temp dir holding the resolved lockfile, removed once osv-scanner has read it. */
   tempDir: string;
 }
 
 interface JavaSbom {
-  /** CycloneDX SBOM file for osv-scanner to scan (auto-detected by the .cdx.json name). */
   path: string;
-  /** Temp dir holding the SBOM, removed once osv-scanner has read it. */
   tempDir: string;
 }
 
@@ -77,7 +94,14 @@ function sanitizeField(text: string | undefined, maxLength: number): string {
   return oneLine.length > maxLength ? `${oneLine.slice(0, maxLength - 1)}…` : oneLine;
 }
 
-/** Breadth-first walk from the root collecting every file named `filename`, skipping
+/** The gitignored subdir for regenerable/sensitive setup artifacts. */
+function setupDir(projectDataDir: string): string {
+  const dir = path.join(projectDataDir, "setup");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Breadth-first walk from the root collecting files named `filename`, skipping
  * vendored and hidden trees. */
 function collectFiles(projectRoot: string, filename: string): string[] {
   const found: string[] = [];
@@ -109,13 +133,9 @@ function collectFiles(projectRoot: string, filename: string): string[] {
   return found;
 }
 
-/**
- * Collect every Python dependency manifest (pyproject.toml) near the root. A
- * monorepo can declare several range-only packages; each one needs floor
- * resolution or its CVEs are silently missed.
- */
+/** Collect Python manifests near the root (capped). */
 export function findManifests(projectRoot: string): string[] {
-  return collectFiles(projectRoot, "pyproject.toml");
+  return collectFiles(projectRoot, "pyproject.toml").slice(0, MAX_MANIFESTS);
 }
 
 /** First Python manifest near the root (kept for callers that only need one). */
@@ -132,21 +152,28 @@ function hasPythonLockfile(dir: string): boolean {
   return PYTHON_LOCKFILES.some((name) => fs.existsSync(path.join(dir, name)));
 }
 
+/** Whether a manifest declares PEP 508 direct URL/VCS/path dependencies (SSRF risk to resolve). */
+export function manifestHasDirectRefs(manifest: string): boolean {
+  try {
+    return DIRECT_REF.test(fs.readFileSync(manifest, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Resolve one Python manifest at one resolution end into a temp requirements lockfile.
+ * Resolve one manifest at one resolution end into a temp requirements lockfile.
  *
- * uv is run with hardening because the manifest is repository-controlled and
- * resolving it is otherwise arbitrary code execution: `--no-build` blocks PEP 517
- * build hooks and dynamic-metadata project builds, `--no-sources` ignores
- * attacker-controlled `[tool.uv.sources]` (custom index/git/path), and cwd is an
- * empty temp dir so no `uv.toml`/`[tool.uv]` from the project tree is honored.
- * Returns undefined (degrading to the source walk) on any failure.
+ * uv is hardened because the manifest is repository-controlled: `--no-build`
+ * blocks PEP 517 build hooks / dynamic-metadata project builds, `--no-sources`
+ * ignores `[tool.uv.sources]`, and cwd is an empty temp dir so no project uv
+ * config is honored. (Manifests with inline direct-URL deps are rejected upstream
+ * of this.) Returns undefined (degrading to the source walk) on any failure.
  */
 function resolveOne(
   manifest: string,
   resolution: (typeof UV_RESOLUTIONS)[number],
-  projectDataDir: string,
-  evidenceName: string,
+  evidencePath: string,
 ): ResolvedLockfile | undefined {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-osv-"));
   const lockfile = path.join(tempDir, "requirements.txt");
@@ -171,9 +198,8 @@ function resolveOne(
       fs.rmSync(tempDir, { recursive: true, force: true });
       return undefined;
     }
-    fs.mkdirSync(projectDataDir, { recursive: true });
-    fs.copyFileSync(lockfile, path.join(projectDataDir, evidenceName));
-    return { spec: `requirements.txt:${lockfile}`, tempDir };
+    fs.copyFileSync(lockfile, evidencePath);
+    return { spec: `requirements.txt:${lockfile}`, sourcePath: lockfile, tempDir };
   } catch {
     fs.rmSync(tempDir, { recursive: true, force: true });
     return undefined;
@@ -181,22 +207,42 @@ function resolveOne(
 }
 
 /**
- * Python packages often declare dependency *ranges* with no lockfile, so
- * osv-scanner reports "no package sources" and misses every dependency CVE. For
- * each manifest that has no real lockfile, resolve both the lowest and highest
- * allowed versions and hand osv-scanner the resolved lockfiles.
+ * Python packages often declare dependency ranges with no pinned lockfile, so
+ * osv-scanner misses their CVEs. For each such manifest, resolve the lowest and
+ * highest allowed versions and hand osv-scanner the resolved lockfiles. Skips
+ * manifests that have a pinned lockfile (osv reads it) or declare direct-URL deps
+ * (resolving them would be an SSRF). Bounded by a manifest cap and an overall
+ * time budget since the resolutions run synchronously.
  */
 function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): ResolvedLockfile[] {
-  if (!toolExists("uv")) return [];
+  if (!toolExists("uv")) {
+    const manifests = findManifests(projectRoot).filter((m) => !hasPythonLockfile(path.dirname(m)));
+    if (manifests.length > 0) {
+      console.warn(
+        "[osv-enrich] uv not found on PATH — range-only Python manifests cannot be floor-resolved, " +
+          "so their dependency CVEs will be missed (this is NOT the same as finding none).",
+      );
+    }
+    return [];
+  }
   const resolved: ResolvedLockfile[] = [];
   const manifests = findManifests(projectRoot);
+  const started = Date.now();
   manifests.forEach((manifest, index) => {
-    // An authoritative lockfile means the installed versions are known; let the
-    // recursive walk read it instead of flagging hypothetical resolved versions.
+    if (Date.now() - started > OVERALL_RESOLVE_BUDGET_MS) return;
     if (hasPythonLockfile(path.dirname(manifest))) return;
+    if (manifestHasDirectRefs(manifest)) {
+      console.warn(
+        `[osv-enrich] skipping floor resolution of ${manifest}: it declares direct-URL/VCS ` +
+          "dependencies, which uv would fetch (SSRF risk).",
+      );
+      return;
+    }
     for (const resolution of UV_RESOLUTIONS) {
+      if (Date.now() - started > OVERALL_RESOLVE_BUDGET_MS) break;
       const suffix = manifests.length > 1 ? `-${index}` : "";
-      const r = resolveOne(manifest, resolution, projectDataDir, `deps-${resolution}${suffix}.txt`);
+      const evidence = path.join(setupDir(projectDataDir), `deps-${resolution}${suffix}.txt`);
+      const r = resolveOne(manifest, resolution, evidence);
       if (r) resolved.push(r);
     }
   });
@@ -204,12 +250,10 @@ function resolveFloorLockfiles(projectRoot: string, projectDataDir: string): Res
 }
 
 /**
- * Maven/Java packages usually pin dependency versions, but osv-scanner can't read
- * a bare pom.xml ("no package sources"). syft resolves the Maven project into a
- * CycloneDX SBOM, which osv-scanner then matches against advisories. syft only
- * catalogs (it does not build or execute project code). Excludes mirror the
- * vendored-tree filter; a copy of the SBOM is kept as evidence. Returns undefined
- * (degrading to the source walk) when there is no pom, syft is missing, or it fails.
+ * Maven/Java packages usually pin versions, but osv-scanner can't read a bare
+ * pom.xml. syft resolves the Maven project into a CycloneDX SBOM that osv-scanner
+ * matches against advisories. syft only catalogs (no build/exec). Returns
+ * undefined when there is no pom, syft is missing, or it fails.
  */
 function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom | undefined {
   if (!findPom(projectRoot) || !toolExists("syft")) return undefined;
@@ -238,8 +282,7 @@ function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom 
       fs.rmSync(tempDir, { recursive: true, force: true });
       return undefined;
     }
-    fs.mkdirSync(projectDataDir, { recursive: true });
-    fs.copyFileSync(sbom, path.join(projectDataDir, "deps-sbom.cdx.json"));
+    fs.copyFileSync(sbom, path.join(setupDir(projectDataDir), "deps-sbom.cdx.json"));
     return { path: sbom, tempDir };
   } catch {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -247,21 +290,32 @@ function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom 
   }
 }
 
+/** Parse osv-scanner JSON (object or raw string); undefined when it isn't a results envelope. */
+function parseResultsEnvelope(raw: string): { results?: unknown[] } | undefined {
+  if (!raw.trim()) return undefined;
+  try {
+    const data = JSON.parse(raw);
+    return data &&
+      typeof data === "object" &&
+      Array.isArray((data as { results?: unknown }).results)
+      ? (data as { results?: unknown[] })
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Run osv-scanner over the project's dependency manifests, persist the result to
- * osv-findings.json, and return a markdown summary of known-vulnerable
- * dependencies for the threat-model prompt.
+ * the gitignored setup/osv-findings.json artifact, and return a markdown summary
+ * for the threat-model prompt.
  *
- * Degrades cleanly: if the required tools are missing it is reported distinctly
- * (no misleading empty artifact), and if osv-scanner finds no sources/advisories
- * the context is empty and setup proceeds unchanged. (osv-scanner exits non-zero
- * when it finds vulnerabilities, so its JSON is read off stdout regardless of
- * exit code.)
+ * Degrades cleanly and reports failures distinctly: a missing tool, or a scan
+ * error/timeout, is logged and does NOT overwrite a prior result with an empty
+ * one (which would read as "no vulnerable dependencies").
  */
 export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEnrichment {
   if (!toolExists("osv-scanner")) {
-    // Distinct from "no vulnerable dependencies": do not write an empty artifact
-    // that readers would mistake for a clean result.
     console.warn(
       "[osv-enrich] osv-scanner not found on PATH — skipping dependency-CVE enrichment " +
         "(this is NOT the same as finding no vulnerable dependencies).",
@@ -271,13 +325,10 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
   const resolved = resolveFloorLockfiles(projectRoot, projectDataDir);
   const javaSbom = resolveJavaSbom(projectRoot, projectDataDir);
   let raw = "";
+  let timedOut = false;
   try {
     const args = ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)];
-    // Scan any resolved floor lockfiles alongside the recursive source walk, so
-    // range-only manifests surface their applicable dependency CVEs.
     for (const lockfile of resolved) args.push(`--lockfile=${lockfile.spec}`);
-    // A Maven project's SBOM (from syft) carries the Java deps osv-scanner can't
-    // read from a bare pom.xml; it is auto-detected by its .cdx.json name.
     if (javaSbom) args.push(javaSbom.path);
     raw = execFileSync("osv-scanner", args, {
       encoding: "utf8",
@@ -286,31 +337,39 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
       timeout: OSV_TIMEOUT_MS,
     });
   } catch (error) {
-    const stdout = (error as { stdout?: unknown })?.stdout;
-    raw = typeof stdout === "string" ? stdout : "";
+    // osv-scanner exits non-zero when it *finds* vulnerabilities (JSON still on
+    // stdout) — that's success. Timeouts/crashes are real failures.
+    const e = error as { stdout?: unknown; killed?: boolean; signal?: string; code?: string };
+    raw = typeof e.stdout === "string" ? e.stdout : "";
+    timedOut = Boolean(e.killed) || e.signal === "SIGTERM" || e.code === "ETIMEDOUT";
   } finally {
-    for (const lockfile of resolved) {
-      fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
-    }
+    for (const lockfile of resolved) fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
     if (javaSbom) fs.rmSync(javaSbom.tempDir, { recursive: true, force: true });
   }
-  const hits = parseOsv(raw);
-  fs.mkdirSync(projectDataDir, { recursive: true });
+
+  const envelope = parseResultsEnvelope(raw);
+  const noSources = /no package sources/i.test(raw);
+  if (timedOut || (!envelope && !noSources)) {
+    // Genuine failure — do not persist an empty result over any prior findings.
+    console.warn(
+      "[osv-enrich] osv-scanner did not complete successfully (timeout or error) — " +
+        "leaving any existing osv-findings.json untouched rather than recording a clean result.",
+    );
+    return { context: "", hits: [] };
+  }
+
+  const resolvedPaths = new Set(resolved.map((r) => r.sourcePath));
+  const hits = parseOsv(raw, resolvedPaths);
   atomicWriteFileSync(
-    path.join(projectDataDir, "osv-findings.json"),
+    path.join(setupDir(projectDataDir), "osv-findings.json"),
     `${JSON.stringify(hits, null, 2)}\n`,
   );
   return { context: buildContext(hits), hits };
 }
 
-export function parseOsv(raw: string): OsvPackageHit[] {
-  if (!raw.trim()) return [];
-  let data: { results?: unknown[] };
-  try {
-    data = JSON.parse(raw);
-  } catch {
-    return [];
-  }
+export function parseOsv(raw: string, resolvedPaths?: Set<string>): OsvPackageHit[] {
+  const data = parseResultsEnvelope(raw);
+  if (!data) return [];
   // A package can surface from more than one source (e.g. a lowest and a highest
   // resolved lockfile, or osv parsing a pom.xml plus an SBOM). Dedupe by
   // name@version@ecosystem, merging advisories (unique by id).
@@ -319,7 +378,9 @@ export function parseOsv(raw: string): OsvPackageHit[] {
     source?: { path?: string };
     packages?: unknown[];
   }>) {
-    if (VENDORED_SOURCE.test(result.source?.path ?? "")) continue;
+    const sourcePath = result.source?.path ?? "";
+    if (VENDORED_SOURCE.test(sourcePath)) continue;
+    const fromResolved = resolvedPaths?.has(sourcePath) ?? false;
     for (const pkg of (result.packages ?? []) as Array<{
       package?: { name?: string; version?: string; ecosystem?: string };
       vulnerabilities?: Array<{ id?: string; summary?: string; details?: string }>;
@@ -336,8 +397,16 @@ export function parseOsv(raw: string): OsvPackageHit[] {
       if (existing) {
         const seen = new Set(existing.vulns.map((v) => v.id));
         for (const v of vulns) if (!seen.has(v.id)) existing.vulns.push(v);
+        // A package is only confirmed-present if some source was a real lockfile.
+        if (!fromResolved) existing.resolved = false;
       } else {
-        byPackage.set(key, { name, version, ecosystem: info.ecosystem, vulns });
+        byPackage.set(key, {
+          name,
+          version,
+          ecosystem: info.ecosystem,
+          vulns,
+          resolved: fromResolved,
+        });
       }
     }
   }
@@ -352,13 +421,16 @@ function shortSummary(text: string | undefined): string | undefined {
 export function buildContext(hits: OsvPackageHit[]): string {
   if (hits.length === 0) return "";
   const blocks = hits.map((h) => {
+    // Floor/ceiling versions are hypothetical (not installed), so mark them so the
+    // review doesn't treat a patched project as actually vulnerable.
+    const marker = h.resolved ? " (resolved range version — not necessarily installed)" : "";
     const vulnLines = h.vulns.map((v) => `  - ${v.id}${v.summary ? `: ${v.summary}` : ""}`);
-    return [`- \`${h.name}@${h.version}\``, ...vulnLines].join("\n");
+    return [`- \`${h.name}@${h.version}\`${marker}`, ...vulnLines].join("\n");
   });
   return [
     "## Known-vulnerable dependencies (from osv-scanner)",
     "",
-    "These declared dependencies have published advisories (id followed by what the advisory is about). In the Threat model and Project-specific patterns to flag sections, note where this codebase actually imports or calls each one, so the review can judge whether the advisory is reachable here rather than merely present.",
+    'These dependencies have published advisories (id followed by what the advisory is about). Rows marked "resolved range version" come from resolving a version range and may not be the installed version — treat them as applicable-if-resolved, not confirmed-present. In the Threat model and Project-specific patterns to flag sections, note where this codebase actually imports or calls each one, so the review can judge whether the advisory is reachable here rather than merely present.',
     "",
     ...blocks,
   ].join("\n");

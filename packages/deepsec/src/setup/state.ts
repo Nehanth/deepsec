@@ -35,6 +35,9 @@ export interface SetupState {
   infoDigest?: string;
   inventoryDigest?: string;
   matcherDigest?: string;
+  /** Set once the dependency-CVE matcher pass has run, so it is not repeated on
+   * resume and is not skipped for upgraded projects that have older matcher attempts. */
+  osvMatcherPassDone?: boolean;
   baselineScanRunId?: string;
   finalScanRunId?: string;
   baselineScanSummary?: {

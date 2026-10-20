@@ -7,6 +7,7 @@ import {
   findManifest,
   findManifests,
   findPom,
+  manifestHasDirectRefs,
   parseOsv,
 } from "../setup/osv-enrich.js";
 
@@ -193,6 +194,59 @@ describe("findPom", () => {
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("manifestHasDirectRefs (SSRF guard)", () => {
+  it("flags PEP 508 direct URL / VCS deps and leaves normal manifests alone", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-ref-"));
+    try {
+      const direct = path.join(root, "direct.toml");
+      fs.writeFileSync(
+        direct,
+        '[project]\ndependencies = ["evil @ https://attacker.example/x.whl"]\n',
+      );
+      expect(manifestHasDirectRefs(direct)).toBe(true);
+
+      const vcs = path.join(root, "vcs.toml");
+      fs.writeFileSync(vcs, '[project]\ndependencies = ["pkg @ git+https://host/r.git"]\n');
+      expect(manifestHasDirectRefs(vcs)).toBe(true);
+
+      const normal = path.join(root, "normal.toml");
+      fs.writeFileSync(normal, '[project]\ndependencies = ["requests>=2.0", "idna"]\n');
+      expect(manifestHasDirectRefs(normal)).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildContext resolved-version labeling", () => {
+  it("marks resolved (hypothetical floor/ceiling) versions distinctly", () => {
+    const ctx = buildContext([
+      { name: "starlette", version: "0.46.0", vulns: [{ id: "X" }], resolved: true },
+      { name: "log4j-core", version: "2.14.1", vulns: [{ id: "Y" }], resolved: false },
+    ]);
+    expect(ctx).toMatch(/`starlette@0\.46\.0` \(resolved range version/);
+    expect(ctx).not.toMatch(/`log4j-core@2\.14\.1` \(resolved/);
+  });
+
+  it("flags a package as resolved via resolvedPaths", () => {
+    const raw = JSON.stringify({
+      results: [
+        {
+          source: { path: "/tmp/x/requirements.txt" },
+          packages: [
+            {
+              package: { name: "starlette", version: "0.46.0", ecosystem: "PyPI" },
+              vulnerabilities: [{ id: "PYSEC-1" }],
+            },
+          ],
+        },
+      ],
+    });
+    const hits = parseOsv(raw, new Set(["/tmp/x/requirements.txt"]));
+    expect(hits[0].resolved).toBe(true);
   });
 });
 

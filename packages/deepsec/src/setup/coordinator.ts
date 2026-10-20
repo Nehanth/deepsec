@@ -282,7 +282,7 @@ function previousConnection(state: SetupState): Record<string, unknown> | undefi
 /** Count the known-vulnerable dependencies the osv step persisted, 0 if none/absent. */
 function readOsvFindingCount(projectDataDir: string): number {
   try {
-    const raw = fs.readFileSync(path.join(projectDataDir, "osv-findings.json"), "utf8");
+    const raw = fs.readFileSync(path.join(projectDataDir, "setup", "osv-findings.json"), "utf8");
     const parsed = JSON.parse(raw);
     return Array.isArray(parsed) ? parsed.length : 0;
   } catch {
@@ -534,10 +534,16 @@ export async function runSetupWorkflow(
         }),
       );
       writeRepositoryAnalysis(projectDataDir, analysis);
-      // Preserve a prior complete (possibly hand-edited) INFO.md — but NOT when the
-      // osv step injected dependency CVEs, or restoring the old file would discard
-      // the advisory-reachability analysis that matcher generation later reads.
-      if (preserveInfo && !osvEnrichment.context) atomicWriteFileSync(infoPath, preserveInfo);
+      // Preserve a prior complete (possibly hand-edited) INFO.md so curated content
+      // isn't lost. When the osv step produced advisory context, append it to the
+      // preserved file instead of dropping either — the curated threat model stays,
+      // and matcher generation (which reads INFO.md) still sees the advisories.
+      if (preserveInfo) {
+        const merged = osvEnrichment.context
+          ? `${preserveInfo.trimEnd()}\n\n${osvEnrichment.context}\n`
+          : preserveInfo;
+        atomicWriteFileSync(infoPath, merged);
+      }
       state.infoDigest = digest(fs.readFileSync(infoPath, "utf8"));
       state.inventoryDigest = digest(analysis.surfaces);
       writeSetupState(state);
@@ -645,10 +651,15 @@ export async function runSetupWorkflow(
     const dependencyCveCount = readOsvFindingCount(projectDataDir);
     const hasDepCves = dependencyCveCount > 0;
 
-    // Run the dependency-CVE matcher pass once (on first-ever matcher generation),
-    // not on every resume — otherwise each resumed setup re-spends agent/scan work
-    // and accumulates duplicate matchers under new slugs.
-    const depCveFirstPass = hasDepCves && state.matcherAttempts.length === 0;
+    // Run the dependency-CVE matcher pass once, tracked by its own flag (not the
+    // append-only matcherAttempts history): this both avoids repeating it on every
+    // resume AND ensures upgraded projects — which may already have older matcher
+    // attempts — still get it after the rubricVersion bump re-enriches the threat model.
+    const depCveFirstPass = hasDepCves && !state.osvMatcherPassDone;
+    if (depCveFirstPass) {
+      state.osvMatcherPassDone = true;
+      writeSetupState(state);
+    }
     const maxAttempts = 2;
     for (
       let attempt = 0;
