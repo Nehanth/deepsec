@@ -86,6 +86,8 @@ export interface SetupWorkflowOptions {
   modelRoute?: ModelRoute;
   packageManager?: SupportedPackageManager;
   skipInstall?: boolean;
+  /** Enable dependency-CVE enrichment for this run (same as `osv: true` in config). */
+  osv?: boolean;
   nonInteractive?: boolean;
   teamId?: string;
   vercelProjectId?: string;
@@ -465,7 +467,9 @@ export async function runSetupWorkflow(
 
     // Dependency-CVE enrichment is opt-in (it runs external, network-reaching tools):
     // enabled per-project with `osv: true` in deepsec.config.ts. Off by default.
-    const osvEnabled = loaded.config.projects.find((p) => p.id === options.projectId)?.osv === true;
+    const osvEnabled =
+      options.osv === true ||
+      loaded.config.projects.find((p) => p.id === options.projectId)?.osv === true;
 
     const loginInput = digest({
       route,
