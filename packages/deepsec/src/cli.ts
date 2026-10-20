@@ -91,6 +91,10 @@ program
   .option("--plan", "Inspect the setup plan without writing files or running setup")
   .option("--scaffold-only", "Only create files; do not install, connect, scan, or process")
   .option("--skip-install", "Require dependencies to exist instead of running pnpm/npm install")
+  .option(
+    "--osv",
+    "Enable dependency-CVE enrichment (runs osv-scanner + uv/syft; reaches the network)",
+  )
   .option("--package-manager <name>", "Installer to use: pnpm or npm", parsePackageManager)
   .option("--agent <type>", "AI agent: codex, claude, or pi")
   .option("--model <model>", "Model for repository analysis and processing")
@@ -155,6 +159,7 @@ Examples:
         plan: opts.plan,
         scaffoldOnly: opts.scaffoldOnly,
         skipInstall: opts.skipInstall,
+        osv: opts.osv,
         packageManager: opts.packageManager,
         agent: opts.agent,
         model: opts.model,
@@ -186,6 +191,10 @@ program
   .option("--root <path>", "Override the configured project root")
   .option("--status", "Show resumable phase status without running setup")
   .option("--skip-install", "Require dependencies to exist instead of running pnpm/npm install")
+  .option(
+    "--osv",
+    "Enable dependency-CVE enrichment (runs osv-scanner + uv/syft; reaches the network)",
+  )
   .option("--package-manager <name>", "Installer to use: pnpm or npm", parsePackageManager)
   .option("--agent <type>", "AI agent: codex, claude, or pi")
   .option("--model <model>", "Model for repository analysis and processing")
