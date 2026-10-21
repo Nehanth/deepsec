@@ -47,7 +47,8 @@ The step calls external binaries and degrades cleanly when they are absent (it l
 
 - `data/<id>/setup/osv-findings.json` records the vulnerable packages and their advisory IDs. This file and the resolver's evidence files live under the gitignored `setup/` directory.
 - The threat model (`INFO.md`) gains a **Known-vulnerable dependencies** section. Rows resolved from a version range are labeled as such, since that version may not be the one installed.
-- Matcher generation receives the threat model, so an advisory whose vulnerable call is reachable in the code gets a matcher and becomes a scan candidate. The investigation phase then judges reachability and writes the finding.
+- That section requires a **Dependency reachability** verdict with one graded line per dependency (`HIGH`/`MEDIUM`/`LOW`, the vulnerable call site as `file:line` or "not called", and the consequence if reached). Fixing this structure keeps a reachable advisory from being summarized away as prose, so the same dependency is graded the same way across runs.
+- Matcher generation receives the threat model, so an advisory graded reachable gets a matcher aimed at its call site and becomes a scan candidate. The investigation phase then confirms reachability and writes the finding.
 
 ## Security notes
 

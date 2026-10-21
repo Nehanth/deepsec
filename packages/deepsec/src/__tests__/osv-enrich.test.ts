@@ -233,6 +233,21 @@ describe("buildContext resolved-version labeling", () => {
     expect(ctx).not.toMatch(/`log4j-core@2\.14\.1` \(resolved/);
   });
 
+  it("emits the required graded reachability block naming every dependency", () => {
+    const ctx = buildContext([
+      { name: "starlette", version: "0.46.0", vulns: [{ id: "X" }], resolved: true },
+      { name: "anyio", version: "3.6.2", vulns: [{ id: "Y" }], resolved: true },
+      { name: "idna", version: "2.8.0", vulns: [{ id: "Z" }], resolved: true },
+    ]);
+    // the structured directive is present and demands a per-dep graded verdict
+    expect(ctx).toContain("### Dependency reachability (required)");
+    expect(ctx).toMatch(/HIGH\|MEDIUM\|LOW/);
+    // every dependency is named in the directive so none can be silently dropped
+    expect(ctx).toContain("`starlette`");
+    expect(ctx).toContain("`anyio`");
+    expect(ctx).toContain("`idna`");
+  });
+
   it("flags a package as resolved via resolvedPaths", () => {
     const raw = JSON.stringify({
       results: [
