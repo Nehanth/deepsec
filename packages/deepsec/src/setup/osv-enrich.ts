@@ -442,11 +442,27 @@ export function buildContext(hits: OsvPackageHit[]): string {
     const vulnLines = h.vulns.map((v) => `  - ${v.id}${v.summary ? `: ${v.summary}` : ""}`);
     return [`- \`${h.name}@${h.version}\`${marker}`, ...vulnLines].join("\n");
   });
+  // Every dependency below must appear in the required verdict block, so the
+  // review always produces a graded, line-anchored reachability judgment per
+  // dependency. Leaving this to free prose is what makes a reachable advisory
+  // (e.g. an unbounded form parse) silently vanish on a noisier run: one run
+  // writes "HIGH reachability, routing.py:443 → multipart DoS" and the finding
+  // lands; another writes "starlette is a heavily-used dependency" and it is
+  // dropped. Pinning the structure removes that variance from the promote step.
+  const names = hits.map((h) => `\`${h.name}\``).join(", ");
   return [
     OSV_CONTEXT_HEADING,
     "",
-    'These dependencies have published advisories (id followed by what the advisory is about). Rows marked "resolved range version" come from resolving a version range and may not be the installed version — treat them as applicable-if-resolved, not confirmed-present. In the Threat model and Project-specific patterns to flag sections, note where this codebase actually imports or calls each one, so the review can judge whether the advisory is reachable here rather than merely present.',
+    'These dependencies have published advisories (id followed by what the advisory is about). Rows marked "resolved range version" come from resolving a version range and may not be the installed version — treat them as applicable-if-resolved, not confirmed-present.',
     "",
     ...blocks,
+    "",
+    "### Dependency reachability (required)",
+    "",
+    `In the Threat model section, emit a \`Dependency reachability\` subsection with exactly one line for EVERY dependency above (${names}) — do not omit any, do not merge them into prose. Use this fixed format per line:`,
+    "",
+    '`- <name>@<version> — <HIGH|MEDIUM|LOW> reachability — <file:line of the vulnerable call site, or "not imported/called by this codebase"> — <the advisory consequence if reached>`',
+    "",
+    "Grade reachability by whether this codebase actually reaches the vulnerable code path: HIGH when it imports and calls the affected API on an attacker-reachable path (name the `file:line`), LOW when the package is only transitive or the affected API is never called here. A dependency graded HIGH with a reachable call site is a finding to promote (steer a matcher at that `file:line`), not merely context; LOW ones stay recorded here. Keep this verdict for every dependency even across refreshes.",
   ].join("\n");
 }
