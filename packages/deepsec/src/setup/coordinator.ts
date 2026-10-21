@@ -551,7 +551,16 @@ export async function runSetupWorkflow(
       // appended section first, then append the freshly generated one (or none).
       // Otherwise refreshes accumulate duplicate sections and keep listing
       // dependencies that have since been patched or removed.
-      if (preserveInfo) {
+      //
+      // Exception: when osv is enabled, `osvEnrichment.context` is a *prompt
+      // directive* (it tells the analysis agent to emit a graded Dependency
+      // reachability block), not a self-contained section. Appending it to the old
+      // INFO.md would persist raw grading instructions and discard the real
+      // reachability verdicts the agent just wove into the freshly generated
+      // INFO.md. Enabling osv is a deliberate "re-analyze with dependencies in
+      // view" action, so keep the fresh analysis (verdicts included) rather than
+      // the preserved copy. The non-osv path keeps curated content as before.
+      if (preserveInfo && !osvEnabled) {
         atomicWriteFileSync(infoPath, mergeInfoWithOsvContext(preserveInfo, osvEnrichment.context));
       }
       state.infoDigest = digest(fs.readFileSync(infoPath, "utf8"));
