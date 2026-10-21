@@ -13,6 +13,19 @@ import {
   setupErrorExitCode,
 } from "../setup/protocol.js";
 
+// Stub the osv enrichment so the coordinator path can be exercised without the
+// external osv-scanner/uv/syft toolchain. `runOsvEnrich` returns a sentinel
+// "directive" context (what buildContext now produces); mergeInfoWithOsvContext
+// stays real so the non-osv preserve path still behaves exactly as in production.
+const OSV_DIRECTIVE_SENTINEL = "### Dependency reachability (required) — DIRECTIVE SENTINEL";
+vi.mock("../setup/osv-enrich.js", async (importActual) => {
+  const actual = await importActual<typeof import("../setup/osv-enrich.js")>();
+  return {
+    ...actual,
+    runOsvEnrich: vi.fn(() => ({ context: OSV_DIRECTIVE_SENTINEL, hits: [] })),
+  };
+});
+
 const originalCwd = process.cwd();
 afterEach(() => process.chdir(originalCwd));
 
@@ -245,6 +258,27 @@ describe("one-shot setup coordinator", () => {
     expect(fs.readFileSync(path.join(workspace, "data", "app", "INFO.md"), "utf8")).toBe(
       curatedInfo,
     );
+
+    // Enabling osv on a project that already has a complete INFO.md must NOT
+    // discard the freshly analyzed reachability verdicts by restoring the old
+    // copy with the raw grading directive appended. The fresh analysis wins.
+    fs.writeFileSync(path.join(workspace, "data", "app", "INFO.md"), curatedInfo);
+    const infoAfterOsv = await (async () => {
+      await runSetupWorkflow({
+        workspaceDir: workspace,
+        projectId: "app",
+        projectRoot: project,
+        through: "threat-model",
+        osv: true,
+        services,
+        onLog: () => undefined,
+      });
+      return fs.readFileSync(path.join(workspace, "data", "app", "INFO.md"), "utf8");
+    })();
+    expect(analyze).toHaveBeenCalledTimes(3); // osv flag invalidated the info checkpoint
+    expect(infoAfterOsv).not.toContain(OSV_DIRECTIVE_SENTINEL); // directive never persisted
+    expect(infoAfterOsv).not.toBe(curatedInfo); // old copy not restored over fresh analysis
+    expect(infoAfterOsv).toContain("## Threat model"); // fresh analysis content kept
   });
 
   it("uses the new harness default model instead of a previous harness model", async () => {
