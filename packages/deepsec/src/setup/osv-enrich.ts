@@ -41,15 +41,86 @@ export const OSV_CONTEXT_HEADING = "## Known-vulnerable dependencies (from osv-s
  * or removed. With no current advisories, the section is dropped entirely.
  */
 export function mergeInfoWithOsvContext(preservedInfo: string, osvContext: string): string {
-  const idx = preservedInfo.indexOf(OSV_CONTEXT_HEADING);
-  const curated = (idx >= 0 ? preservedInfo.slice(0, idx) : preservedInfo).trimEnd();
+  const curated = removeSection(preservedInfo, OSV_CONTEXT_HEADING, /\n## /).trimEnd();
   return osvContext.trim() ? `${curated}\n\n${osvContext}\n` : `${curated}\n`;
+}
+
+/** Subsection the analysis agent writes inside "## Threat model" when osv is on. */
+export const REACHABILITY_HEADING = "### Dependency reachability";
+
+/**
+ * Remove the section that starts at `heading` and runs until the next heading
+ * matched by `nextHeading` (or end of file). Content after the section is kept,
+ * so a curated section that follows it is never lost.
+ */
+function removeSection(info: string, heading: string, nextHeading: RegExp): string {
+  const idx = findHeading(info, heading);
+  if (idx < 0) return info;
+  const after = info.slice(idx + heading.length);
+  const end = after.search(nextHeading);
+  const head = info.slice(0, idx).trimEnd();
+  const tail = end >= 0 ? after.slice(end).replace(/^\n+/, "") : "";
+  return tail ? `${head}\n\n${tail}` : `${head}\n`;
+}
+
+/** Index of `heading` at the start of a line, or -1. */
+function findHeading(info: string, heading: string): number {
+  if (info.startsWith(heading)) return 0;
+  const idx = info.indexOf(`\n${heading}`);
+  return idx < 0 ? -1 : idx + 1;
+}
+
+/**
+ * The agent-written "### Dependency reachability" block from an INFO.md, or
+ * undefined when the analysis did not produce one. Ends at the next heading of
+ * level 1–3.
+ */
+export function extractReachabilityBlock(info: string): string | undefined {
+  const idx = findHeading(info, REACHABILITY_HEADING);
+  if (idx < 0) return undefined;
+  const rest = info.slice(idx + REACHABILITY_HEADING.length);
+  const end = rest.search(/\n#{1,3} /);
+  const block = info.slice(idx, idx + REACHABILITY_HEADING.length + (end >= 0 ? end : rest.length));
+  return block.trim() || undefined;
+}
+
+/**
+ * Put a fresh reachability block into a preserved (possibly hand-edited)
+ * INFO.md: replace an existing block, or append it to the end of the
+ * "## Threat model" section. With `block` undefined, an existing block is
+ * removed. Everything else the user curated is kept as-is.
+ */
+export function spliceReachabilityBlock(info: string, block: string | undefined): string {
+  const without = removeSection(info, REACHABILITY_HEADING, /\n#{1,3} /);
+  if (!block) return without.endsWith("\n") ? without : `${without}\n`;
+  const tm = findHeading(without, "## Threat model");
+  if (tm < 0) return `${without.trimEnd()}\n\n${block}\n`;
+  const afterTm = without.slice(tm + "## Threat model".length);
+  const next = afterTm.search(/\n## /);
+  const insertAt = next >= 0 ? tm + "## Threat model".length + next : without.length;
+  const before = without.slice(0, insertAt).trimEnd();
+  const rest = without.slice(insertAt).replace(/^\n+/, "");
+  return rest ? `${before}\n\n${block}\n\n${rest}` : `${before}\n\n${block}\n`;
 }
 
 // osv-scanner's recursive walk also descends into deepsec's own workspace and any
 // vendored trees, reporting their dependencies as the project's. Drop results
 // whose lockfile sits under one of these.
 const VENDORED_SOURCE = /(^|\/)(\.deepsec|node_modules|vendor)(\/|$)/;
+
+/**
+ * Whether a result's source sits in a vendored tree *inside* the project. The
+ * check runs on the path relative to the project root, so a project that itself
+ * lives under a directory named vendor/ (e.g. /home/ci/vendor/acme-api) is not
+ * mistaken for vendored code. Sources outside the root — the resolved lockfiles
+ * and SBOM in the temp dir — are never treated as vendored.
+ */
+function isVendoredSource(sourcePath: string, projectRoot?: string): boolean {
+  if (!projectRoot) return VENDORED_SOURCE.test(sourcePath);
+  const rel = path.relative(path.resolve(projectRoot), sourcePath);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  return VENDORED_SOURCE.test(rel.split(path.sep).join("/"));
+}
 const MAX_SUMMARY_LENGTH = 160;
 // Package name/version come from repo-controlled lockfiles and are interpolated
 // into the threat-model prompt, so they are collapsed and clamped to block
@@ -65,9 +136,12 @@ const OVERALL_RESOLVE_BUDGET_MS = 300_000;
 const MAX_MANIFESTS = 10;
 // How far below the root to look for dependency manifests.
 const MANIFEST_SCAN_DEPTH = 3;
-// Range resolution ends: lowest = worst-case/applicable floor, highest = "safe if
-// installed today". Scanning both widens coverage of versions the range permits.
-const UV_RESOLUTIONS = ["lowest", "highest"] as const;
+// Range resolution ends: lowest-direct = the oldest version each *declared*
+// dependency's range allows (the applicable floor), highest = "what a fresh install
+// gets today". lowest-direct, not lowest: plain `lowest` also drags transitive
+// dependencies down to ancient versions no real install would pick, which floods
+// the report with advisories that cannot apply.
+const UV_RESOLUTIONS = ["lowest-direct", "highest"] as const;
 // Pinned lockfiles next to the manifest mean the installed versions are known;
 // osv-scanner's recursive walk reads them directly, so skip floor resolution.
 // requirements.txt is intentionally excluded — it is often unpinned (ranges), so
@@ -211,14 +285,32 @@ function resolveOne(
     );
     if (!fs.existsSync(lockfile)) {
       fs.rmSync(tempDir, { recursive: true, force: true });
+      warnResolveFailed(manifest, resolution, "uv produced no lockfile");
       return undefined;
     }
     fs.copyFileSync(lockfile, evidencePath);
     return { spec: `requirements.txt:${lockfile}`, sourcePath: lockfile, tempDir };
-  } catch {
+  } catch (error) {
     fs.rmSync(tempDir, { recursive: true, force: true });
+    warnResolveFailed(manifest, resolution, errorReason(error));
     return undefined;
   }
+}
+
+/** Short, single-line reason for a failed subprocess (timeout vs exit code). */
+function errorReason(error: unknown): string {
+  const e = error as { killed?: boolean; signal?: string; code?: string; status?: number };
+  if (e.killed || e.signal === "SIGTERM" || e.code === "ETIMEDOUT") return "timed out";
+  return typeof e.status === "number" ? `exit code ${e.status}` : "failed to run";
+}
+
+// A failed resolution must not read as "no vulnerable dependencies": say so.
+function warnResolveFailed(manifest: string, resolution: string, reason: string): void {
+  console.warn(
+    `[osv-enrich] could not resolve ${manifest} (${resolution}): ${reason} — its dependency ` +
+      "CVEs are not scanned (this is NOT the same as finding none). Common causes: a " +
+      "dependency floor published only as an sdist, or dynamic dependencies that need a build.",
+  );
 }
 
 /**
@@ -295,12 +387,14 @@ function resolveJavaSbom(projectRoot: string, projectDataDir: string): JavaSbom 
     );
     if (!fs.existsSync(sbom)) {
       fs.rmSync(tempDir, { recursive: true, force: true });
+      warnResolveFailed(path.join(projectRoot, "pom.xml"), "syft", "syft produced no SBOM");
       return undefined;
     }
     fs.copyFileSync(sbom, path.join(setupDir(projectDataDir), "deps-sbom.cdx.json"));
     return { path: sbom, tempDir };
-  } catch {
+  } catch (error) {
     fs.rmSync(tempDir, { recursive: true, force: true });
+    warnResolveFailed(path.join(projectRoot, "pom.xml"), "syft", errorReason(error));
     return undefined;
   }
 }
@@ -340,6 +434,7 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
   const resolved = resolveFloorLockfiles(projectRoot, projectDataDir);
   const javaSbom = resolveJavaSbom(projectRoot, projectDataDir);
   let raw = "";
+  let stderr = "";
   let timedOut = false;
   try {
     const args = ["scan", "source", "-r", "--format", "json", path.resolve(projectRoot)];
@@ -348,14 +443,24 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
     raw = execFileSync("osv-scanner", args, {
       encoding: "utf8",
       maxBuffer: 64 * 1024 * 1024,
-      stdio: ["ignore", "pipe", "ignore"],
+      // stderr is captured, not discarded: osv-scanner reports "No package
+      // sources found" there (exit 128, empty stdout), and that is a clean
+      // result, not a failure.
+      stdio: ["ignore", "pipe", "pipe"],
       timeout: OSV_TIMEOUT_MS,
     });
   } catch (error) {
     // osv-scanner exits non-zero when it *finds* vulnerabilities (JSON still on
     // stdout) — that's success. Timeouts/crashes are real failures.
-    const e = error as { stdout?: unknown; killed?: boolean; signal?: string; code?: string };
+    const e = error as {
+      stdout?: unknown;
+      stderr?: unknown;
+      killed?: boolean;
+      signal?: string;
+      code?: string;
+    };
     raw = typeof e.stdout === "string" ? e.stdout : "";
+    stderr = typeof e.stderr === "string" ? e.stderr : "";
     timedOut = Boolean(e.killed) || e.signal === "SIGTERM" || e.code === "ETIMEDOUT";
   } finally {
     for (const lockfile of resolved) fs.rmSync(lockfile.tempDir, { recursive: true, force: true });
@@ -363,7 +468,7 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
   }
 
   const envelope = parseResultsEnvelope(raw);
-  const noSources = /no package sources/i.test(raw);
+  const noSources = /no package sources/i.test(`${raw}\n${stderr}`);
   if (timedOut || (!envelope && !noSources)) {
     // Genuine failure — do not persist an empty result over any prior findings.
     console.warn(
@@ -374,7 +479,7 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
   }
 
   const resolvedPaths = new Set(resolved.map((r) => r.sourcePath));
-  const hits = parseOsv(raw, resolvedPaths);
+  const hits = parseOsv(raw, resolvedPaths, projectRoot);
   atomicWriteFileSync(
     path.join(setupDir(projectDataDir), "osv-findings.json"),
     `${JSON.stringify(hits, null, 2)}\n`,
@@ -382,7 +487,11 @@ export function runOsvEnrich(projectRoot: string, projectDataDir: string): OsvEn
   return { context: buildContext(hits), hits };
 }
 
-export function parseOsv(raw: string, resolvedPaths?: Set<string>): OsvPackageHit[] {
+export function parseOsv(
+  raw: string,
+  resolvedPaths?: Set<string>,
+  projectRoot?: string,
+): OsvPackageHit[] {
   const data = parseResultsEnvelope(raw);
   if (!data) return [];
   // A package can surface from more than one source (e.g. a lowest and a highest
@@ -394,7 +503,7 @@ export function parseOsv(raw: string, resolvedPaths?: Set<string>): OsvPackageHi
     packages?: unknown[];
   }>) {
     const sourcePath = result.source?.path ?? "";
-    if (VENDORED_SOURCE.test(sourcePath)) continue;
+    if (isVendoredSource(sourcePath, projectRoot)) continue;
     const fromResolved = resolvedPaths?.has(sourcePath) ?? false;
     for (const pkg of (result.packages ?? []) as Array<{
       package?: { name?: string; version?: string; ecosystem?: string };

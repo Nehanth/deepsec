@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildContext,
+  extractReachabilityBlock,
   findManifest,
   findManifests,
   findPom,
@@ -11,6 +12,7 @@ import {
   mergeInfoWithOsvContext,
   OSV_CONTEXT_HEADING,
   parseOsv,
+  spliceReachabilityBlock,
 } from "../setup/osv-enrich.js";
 
 // osv-scanner's JSON groups packages under results[].packages[], each result
@@ -303,5 +305,86 @@ describe("buildContext", () => {
     ]);
     expect(ctx).toContain("`idna@2.8`");
     expect(ctx).toContain("PYSEC-2024-60: ReDoS");
+  });
+});
+
+describe("mergeInfoWithOsvContext (section boundaries)", () => {
+  it("removes only the osv section, keeping curated sections that follow it", () => {
+    const info = `# app\n\n## What this codebase does\nApp.\n\n${OSV_CONTEXT_HEADING}\n\n- \`x@1\`\n  - CVE-1\n\n## Threat model\nCurated threats.\n`;
+    const out = mergeInfoWithOsvContext(info, "");
+    expect(out).not.toContain(OSV_CONTEXT_HEADING);
+    expect(out).not.toContain("CVE-1");
+    expect(out).toContain("## Threat model\nCurated threats.");
+    expect(out).toContain("## What this codebase does\nApp.");
+  });
+});
+
+describe("dependency reachability splice", () => {
+  const curated =
+    "# app\n\n## Threat model\nCurated threats.\n\n## Project-specific patterns to flag\nRoutes.\n";
+  const block =
+    "### Dependency reachability\n- starlette@0.46.0 — HIGH reachability — r.py:1 — DoS";
+
+  it("extracts the agent's block and stops at the next section", () => {
+    const fresh = `# app\n\n## Threat model\nX.\n\n${block}\n\n## Project-specific patterns to flag\nY.\n`;
+    expect(extractReachabilityBlock(fresh)).toBe(block);
+    expect(extractReachabilityBlock(curated)).toBeUndefined();
+  });
+
+  it("inserts the block at the end of the Threat model section", () => {
+    const out = spliceReachabilityBlock(curated, block);
+    expect(out).toContain("Curated threats.");
+    expect(out.indexOf("Curated threats.")).toBeLessThan(out.indexOf(block));
+    expect(out.indexOf(block)).toBeLessThan(out.indexOf("## Project-specific patterns to flag"));
+  });
+
+  it("replaces a previous block instead of accumulating", () => {
+    const once = spliceReachabilityBlock(curated, block);
+    const newer =
+      "### Dependency reachability\n- anyio@4.0.0 — LOW reachability — not called — n/a";
+    const twice = spliceReachabilityBlock(once, newer);
+    expect(twice.match(/### Dependency reachability/g)).toHaveLength(1);
+    expect(twice).toContain("anyio@4.0.0");
+    expect(twice).not.toContain("starlette@0.46.0");
+  });
+
+  it("removes stale verdicts when given no block", () => {
+    const out = spliceReachabilityBlock(spliceReachabilityBlock(curated, block), undefined);
+    expect(out).not.toContain("Dependency reachability");
+    expect(out).toContain("## Project-specific patterns to flag\nRoutes.");
+  });
+});
+
+describe("parseOsv vendored-tree filter", () => {
+  const result = (p: string) => ({
+    source: { path: p },
+    packages: [
+      {
+        package: { name: "requests", version: "2.0.0", ecosystem: "PyPI" },
+        vulnerabilities: [{ id: "CVE-X" }],
+      },
+    ],
+  });
+
+  it("does not drop a project that itself lives under a vendor/ directory", () => {
+    const root = "/home/ci/vendor/acme-api";
+    const raw = JSON.stringify({ results: [result(`${root}/requirements.txt`)] });
+    expect(parseOsv(raw, undefined, root)).toHaveLength(1);
+  });
+
+  it("still drops vendored trees inside the project", () => {
+    const root = "/home/ci/acme-api";
+    const raw = JSON.stringify({
+      results: [
+        result(`${root}/node_modules/x/requirements.txt`),
+        result(`${root}/.deepsec/a.txt`),
+      ],
+    });
+    expect(parseOsv(raw, undefined, root)).toEqual([]);
+  });
+
+  it("keeps resolved lockfiles that live outside the project root", () => {
+    const raw = JSON.stringify({ results: [result("/tmp/deepsec-osv-1/requirements.txt")] });
+    expect(parseOsv(raw, undefined, "/home/ci/acme-api")).toHaveLength(1);
   });
 });
