@@ -164,6 +164,72 @@ describe("proposeGeneratedMatchers partial validation", () => {
   });
 });
 
+describe("proposeGeneratedMatchers shape normalization", () => {
+  async function propose(items: unknown[]) {
+    const runTask = (async () => JSON.stringify(items)) as ProposeMatchersOptions["runTask"];
+    return proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+  }
+
+  it('accepts a single string where a list is expected ("tech": "java")', async () => {
+    const result = await propose([
+      { ...spec("ws-subscribe"), requires: { tech: "java", sentinelFiles: "**/pom.xml" } },
+    ]);
+
+    expect(result.rejected).toEqual([]);
+    expect(result.plugins.map((p) => p.slug)).toEqual(["ws-subscribe"]);
+    expect(result.specs[0].requires).toEqual({ tech: ["java"], sentinelFiles: ["**/pom.xml"] });
+  });
+
+  it("wraps single-string top-level list fields", async () => {
+    const result = await propose([
+      {
+        ...spec("one-liner"),
+        filePatterns: "**/*.ts",
+        examples: "export const value = 1",
+        closesSurfaceIds: "api",
+      },
+    ]);
+
+    expect(result.rejected).toEqual([]);
+    expect(result.specs[0]).toMatchObject({
+      filePatterns: ["**/*.ts"],
+      examples: ["export const value = 1"],
+      closesSurfaceIds: ["api"],
+    });
+  });
+
+  it("treats an empty regex flag as no flags", async () => {
+    const result = await propose([
+      { ...spec("no-flags"), patterns: [{ source: "export", flags: "", label: "export" }] },
+    ]);
+
+    expect(result.rejected).toEqual([]);
+    expect(result.specs[0].patterns[0]).not.toHaveProperty("flags");
+  });
+
+  it("still rejects a genuinely invalid matcher after normalizing", async () => {
+    const result = await propose([
+      spec("good-route"),
+      { ...spec("bad-example"), requires: { tech: "java" }, examples: ["no keyword here"] },
+    ]);
+
+    expect(result.plugins.map((p) => p.slug)).toEqual(["good-route"]);
+    expect(result.rejected?.[0]).toMatchObject({ slug: "bad-example" });
+  });
+
+  it("tells the agent that list fields are arrays", async () => {
+    let prompt = "";
+    const runTask = (async (params: { prompt: string }) => {
+      prompt = params.prompt;
+      return "[]";
+    }) as ProposeMatchersOptions["runTask"];
+    await proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+
+    expect(prompt).toContain('"tech": ["java"]');
+    expect(prompt).toContain("tech: array of strings");
+  });
+});
+
 describe("generated matcher persistence", () => {
   it("reads previous specs so a resumed generation pass can append", () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-matchers-"));

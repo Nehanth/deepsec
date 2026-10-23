@@ -43,6 +43,44 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const LIST_FIELDS = [
+  "filePatterns",
+  "excludeFilePatterns",
+  "examples",
+  "closesSurfaceIds",
+] as const;
+const REQUIRES_LIST_FIELDS = ["tech", "sentinelFiles"] as const;
+
+/**
+ * Fix unambiguous shape slips the setup agent makes before validating: a
+ * single string where the schema wants a one-item list (`"tech": "java"`), and
+ * an empty regex `flags` (meaning no flags). Anything else is left for the
+ * schema to judge.
+ */
+function normalizeProposal(item: unknown): unknown {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return item;
+  const spec = { ...(item as Record<string, unknown>) };
+  for (const key of LIST_FIELDS) {
+    if (typeof spec[key] === "string") spec[key] = [spec[key]];
+  }
+  const requires = spec.requires;
+  if (requires && typeof requires === "object" && !Array.isArray(requires)) {
+    const next = { ...(requires as Record<string, unknown>) };
+    for (const key of REQUIRES_LIST_FIELDS) {
+      if (typeof next[key] === "string") next[key] = [next[key]];
+    }
+    spec.requires = next;
+  }
+  if (Array.isArray(spec.patterns)) {
+    spec.patterns = spec.patterns.map((pattern) => {
+      if (!pattern || typeof pattern !== "object") return pattern;
+      const { flags, ...rest } = pattern as Record<string, unknown>;
+      return flags === "" ? rest : pattern;
+    });
+  }
+  return spec;
+}
+
 /**
  * Compile each proposed matcher on its own, so one invalid matcher (an example
  * its pattern doesn't match, an unsupported regex) drops only itself instead of
@@ -57,7 +95,9 @@ function compileEach(
   const rejected: RejectedMatcher[] = [];
   items.forEach((item, index) => {
     try {
-      const [plugin] = compileDeclarativeMatchers([item], { existingSlugs: slugs });
+      const [plugin] = compileDeclarativeMatchers([normalizeProposal(item)], {
+        existingSlugs: slugs,
+      });
       slugs.add(plugin.slug);
       plugins.push(plugin);
     } catch (error) {
@@ -111,7 +151,7 @@ ${options.threatModel.trim()}`
       : "";
   const prompt = `Design narrow, data-only deepsec coverage matchers for the repository. Read files only; do not execute code, use the network, read env files, or install packages.
 
-Return ONLY a JSON array. Each item must have exactly: version:1, slug (kebab-case), description, noiseTier (precise|normal|noisy), filePatterns, optional requires {tech and/or sentinelFiles}, patterns [{source, optional flags i|m|im, label}], optional excludeFilePatterns, examples (each must match a pattern), and closesSurfaceIds.
+Return ONLY a JSON array. Each item must have exactly: version:1, slug (kebab-case), description, noiseTier (precise|normal|noisy), filePatterns (array of globs), optional requires {tech: array of strings, and/or sentinelFiles: array of globs}, patterns (array of {source, optional flags i|m|im, label}), optional excludeFilePatterns (array of globs), examples (array of strings, each must match a pattern), and closesSurfaceIds (array). Every list-valued field is a JSON array even with one item, e.g. "tech": ["java"].
 
 Only close a surface when the matcher targets its concrete framework/registration primitive. Prefer anchored, framework-specific patterns. Never emit a broad catch-all. Existing slugs must not be reused: ${JSON.stringify(options.existingSlugs)}.
 
