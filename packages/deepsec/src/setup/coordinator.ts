@@ -874,11 +874,16 @@ export async function runSetupWorkflow(
         acceptedSlugs: proposal.plugins
           .map((matcher) => matcher.slug)
           .filter((slug) => !exploding.has(slug)),
-        rejected: [...exploding].map((slug) => ({
-          slug,
-          reason:
-            explosionReasons.get(slug) ?? "generated matcher exceeded the configured breadth limit",
-        })),
+        rejected: [
+          // Proposed matchers dropped at validation (the rest of the proposal was kept).
+          ...(proposal.rejected ?? []),
+          ...[...exploding].map((slug) => ({
+            slug,
+            reason:
+              explosionReasons.get(slug) ??
+              "generated matcher exceeded the configured breadth limit",
+          })),
+        ],
         outcome: "rescanned",
         scanRunId: finalResult.runId,
       });

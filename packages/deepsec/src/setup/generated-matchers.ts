@@ -25,6 +25,12 @@ export interface ProposeMatchersOptions {
   runTask?: typeof runSetupTask;
 }
 
+/** A proposed matcher that failed validation and was dropped. */
+export interface RejectedMatcher {
+  slug: string;
+  reason: string;
+}
+
 function extractArray(raw: string): unknown[] {
   const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
   const text = (fenced ?? raw).trim();
@@ -33,13 +39,62 @@ function extractArray(raw: string): unknown[] {
   return parsed;
 }
 
-export async function proposeGeneratedMatchers(
-  options: ProposeMatchersOptions,
-): Promise<{ specs: DeclarativeMatcherSpec[]; plugins: DeclarativeMatcherPlugin[] }> {
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Compile each proposed matcher on its own, so one invalid matcher (an example
+ * its pattern doesn't match, an unsupported regex) drops only itself instead of
+ * failing the whole proposal.
+ */
+function compileEach(
+  items: unknown[],
+  existingSlugs: Iterable<string>,
+): { plugins: DeclarativeMatcherPlugin[]; rejected: RejectedMatcher[] } {
+  const slugs = new Set(existingSlugs);
+  const plugins: DeclarativeMatcherPlugin[] = [];
+  const rejected: RejectedMatcher[] = [];
+  items.forEach((item, index) => {
+    try {
+      const [plugin] = compileDeclarativeMatchers([item], { existingSlugs: slugs });
+      slugs.add(plugin.slug);
+      plugins.push(plugin);
+    } catch (error) {
+      const slug = (item as { slug?: unknown } | null)?.slug;
+      rejected.push({
+        slug: typeof slug === "string" && slug ? slug : `#${index}`,
+        reason: errorMessage(error),
+      });
+    }
+  });
+  return { plugins, rejected };
+}
+
+/** Parse and compile one agent response; an unparseable response rejects as a whole. */
+function compileResponse(
+  raw: string,
+  existingSlugs: Iterable<string>,
+): { plugins: DeclarativeMatcherPlugin[]; rejected: RejectedMatcher[] } {
+  let items: unknown[];
+  try {
+    items = extractArray(raw);
+  } catch (error) {
+    return { plugins: [], rejected: [{ slug: "(proposal)", reason: errorMessage(error) }] };
+  }
+  return compileEach(items, existingSlugs);
+}
+
+export async function proposeGeneratedMatchers(options: ProposeMatchersOptions): Promise<{
+  specs: DeclarativeMatcherSpec[];
+  plugins: DeclarativeMatcherPlugin[];
+  /** Proposed matchers dropped at validation; the rest of the proposal was kept. */
+  rejected?: RejectedMatcher[];
+}> {
   const uncovered = options.coverage.surfaces.filter((surface) => !surface.passed);
   const hasDepCves = (options.dependencyCveCount ?? 0) > 0;
   if (uncovered.length === 0 && options.coverage.languageWarnings.length === 0 && !hasDepCves) {
-    return { specs: [], plugins: [] };
+    return { specs: [], plugins: [], rejected: [] };
   }
   // When the project has known-vulnerable dependencies, point the agent at the
   // reachable advisories from the threat model so the vulnerable call sites get a
@@ -71,25 +126,37 @@ Coverage gaps: ${JSON.stringify({ surfaces: uncovered, languages: options.covera
     signal: options.signal,
     onProgress: options.onProgress,
   });
-  try {
-    const plugins = compileDeclarativeMatchers(extractArray(raw), {
-      existingSlugs: options.existingSlugs,
-    });
-    return { specs: plugins.map((plugin) => plugin.declarativeSpec), plugins };
-  } catch (error) {
+  const first = compileResponse(raw, options.existingSlugs);
+  let plugins = first.plugins;
+  let rejected = first.rejected;
+  if (rejected.length > 0) {
+    // Keep what validated; ask once for replacements of only the rejected matchers.
+    const accepted = plugins.map((plugin) => plugin.slug);
     raw = await runTask({
       agentType: options.agentType,
       projectRoot: options.projectRoot,
-      prompt: `${prompt}\n\nThe previous output failed validation: ${error instanceof Error ? error.message : String(error)}. Return a corrected JSON array only.`,
+      prompt: `${prompt}\n\nThese proposed matchers failed validation and were dropped:\n${rejected
+        .map((r) => `- ${r.slug}: ${r.reason}`)
+        .join(
+          "\n",
+        )}\nThese were accepted and must not be repeated: ${JSON.stringify(accepted)}. Return a JSON array containing only corrected replacements for the dropped matchers (or [] if none can be fixed).`,
       config: options.agentConfig,
       signal: options.signal,
       onProgress: options.onProgress,
     });
-    const plugins = compileDeclarativeMatchers(extractArray(raw), {
-      existingSlugs: options.existingSlugs,
-    });
-    return { specs: plugins.map((plugin) => plugin.declarativeSpec), plugins };
+    const retry = compileResponse(raw, [...options.existingSlugs, ...accepted]);
+    plugins = [...plugins, ...retry.plugins];
+    // Every spec that was dropped, from either round (a replacement may have taken its place).
+    rejected = [...rejected, ...retry.rejected];
   }
+  if (plugins.length === 0 && rejected.length > 0) {
+    throw new Error(
+      `No proposed matcher passed validation: ${rejected
+        .map((r) => `${r.slug}: ${r.reason}`)
+        .join("; ")}`,
+    );
+  }
+  return { specs: plugins.map((plugin) => plugin.declarativeSpec), plugins, rejected };
 }
 
 export function writeGeneratedMatchers(
