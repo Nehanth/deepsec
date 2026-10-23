@@ -97,6 +97,73 @@ describe("proposeGeneratedMatchers dependency-CVE steering", () => {
   });
 });
 
+describe("proposeGeneratedMatchers partial validation", () => {
+  // Shapes the setup agent really produced: an example its own pattern doesn't
+  // match, and a regex with stacked wildcards the safety check refuses.
+  const badExample = { ...spec("bad-example"), examples: ["no keyword here"] };
+  const badWildcard = {
+    ...spec("bad-wildcard"),
+    patterns: [{ source: "export.*const.*value", label: "x" }],
+    examples: ["export const value = 1"],
+  };
+
+  /** Agent stub that returns each response in turn and records every prompt. */
+  function agent(...responses: unknown[][]) {
+    const prompts: string[] = [];
+    const runTask = (async (params: { prompt: string }) => {
+      prompts.push(params.prompt);
+      return JSON.stringify(responses[prompts.length - 1] ?? []);
+    }) as ProposeMatchersOptions["runTask"];
+    return { runTask, prompts };
+  }
+
+  it("keeps the valid matchers when one fails, instead of rejecting the whole proposal", async () => {
+    const { runTask, prompts } = agent([spec("good-route"), badExample], []);
+    const result = await proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+
+    expect(result.plugins.map((p) => p.slug)).toEqual(["good-route"]);
+    expect(result.rejected?.map((r) => r.slug)).toEqual(["bad-example"]);
+    expect(result.rejected?.[0].reason).toMatch(/must be matched by at least one declared pattern/);
+    // one retry, asking only for replacements and naming what was already accepted
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain("bad-example");
+    expect(prompts[1]).toContain('["good-route"]');
+  });
+
+  it("adds a corrected replacement from the retry alongside the kept matchers", async () => {
+    const { runTask } = agent([spec("good-route"), badWildcard], [spec("fixed-route")]);
+    const result = await proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+
+    expect(result.plugins.map((p) => p.slug)).toEqual(["good-route", "fixed-route"]);
+    expect(result.rejected?.[0]).toMatchObject({ slug: "bad-wildcard" });
+    expect(result.rejected?.[0].reason).toMatch(/multiple wildcard repetitions/);
+  });
+
+  it("does not retry when every proposed matcher is valid", async () => {
+    const { runTask, prompts } = agent([spec("good-route"), spec("other-route")]);
+    const result = await proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+
+    expect(result.plugins).toHaveLength(2);
+    expect(result.rejected).toEqual([]);
+    expect(prompts).toHaveLength(1);
+  });
+
+  it("still fails when no proposed matcher validates in either round", async () => {
+    const { runTask } = agent([badExample], [badWildcard]);
+    await expect(
+      proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 })),
+    ).rejects.toThrow(/No proposed matcher passed validation/);
+  });
+
+  it("drops a duplicate slug from the retry rather than failing", async () => {
+    const { runTask } = agent([spec("good-route"), badExample], [spec("good-route")]);
+    const result = await proposeGeneratedMatchers(baseOptions({ runTask, dependencyCveCount: 1 }));
+
+    expect(result.plugins.map((p) => p.slug)).toEqual(["good-route"]);
+    expect(result.rejected?.map((r) => r.slug)).toEqual(["bad-example", "good-route"]);
+  });
+});
+
 describe("generated matcher persistence", () => {
   it("reads previous specs so a resumed generation pass can append", () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), "deepsec-matchers-"));

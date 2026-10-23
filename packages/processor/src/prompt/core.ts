@@ -77,6 +77,8 @@ When project context (INFO.md) includes a **Dependency reachability** section, t
 - **MEDIUM reachability**: judge it on its merits like any other candidate.
 - **LOW reachability**: the affected API is not called, or the package is only transitive. Keep it as context; do NOT raise a standalone finding on the basis of a LOW grade. The one exception: if you find a concrete reachable call site (\`file:line\`) that the grading missed, treat it as reachable and promote — a LOW grade is a starting assumption, not a reason to ignore evidence.
 
+When project context (INFO.md) includes a **Package advisories from newer releases** section, those are advisories for the scanned package itself. For each one marked LIKELY AFFECTED or CHECK, open the named code and decide: if the vulnerable code is present and unpatched, file a finding at that location citing the advisory ID and its fixed version; if OSV recorded the advisory only for newer releases, say that this version is affected even though no advisory lists it. If the fix is already applied or the vulnerable code isn't here, don't file a finding.
+
 ## Auth Bypass Patterns to Look For
 
 Beyond missing auth, look for **subtle bypasses** in code that appears to have auth:
