@@ -34,6 +34,9 @@ export interface OsvEnrichment {
 /** Heading of the appended advisory section — shared so callers can locate/replace it. */
 export const OSV_CONTEXT_HEADING = "## Known-vulnerable dependencies (from osv-scanner)";
 
+/** Heading of the package's own advisory context (see package-advisories.ts). */
+export const PACKAGE_CONTEXT_HEADING = "## Package advisories (from OSV)";
+
 /**
  * Merge a preserved (possibly hand-edited) INFO.md with the current osv advisory
  * section. Strips any previously appended section first, so refreshes don't
@@ -41,7 +44,11 @@ export const OSV_CONTEXT_HEADING = "## Known-vulnerable dependencies (from osv-s
  * or removed. With no current advisories, the section is dropped entirely.
  */
 export function mergeInfoWithOsvContext(preservedInfo: string, osvContext: string): string {
-  const curated = removeSection(preservedInfo, OSV_CONTEXT_HEADING, /\n## /).trimEnd();
+  const curated = removeSection(
+    removeSection(preservedInfo, OSV_CONTEXT_HEADING, /\n## /),
+    PACKAGE_CONTEXT_HEADING,
+    /\n## /,
+  ).trimEnd();
   return osvContext.trim() ? `${curated}\n\n${osvContext}\n` : `${curated}\n`;
 }
 
@@ -75,12 +82,15 @@ function findHeading(info: string, heading: string): number {
  * undefined when the analysis did not produce one. Ends at the next heading of
  * level 1–3.
  */
-export function extractReachabilityBlock(info: string): string | undefined {
-  const idx = findHeading(info, REACHABILITY_HEADING);
+export function extractReachabilityBlock(
+  info: string,
+  heading: string = REACHABILITY_HEADING,
+): string | undefined {
+  const idx = findHeading(info, heading);
   if (idx < 0) return undefined;
-  const rest = info.slice(idx + REACHABILITY_HEADING.length);
+  const rest = info.slice(idx + heading.length);
   const end = rest.search(/\n#{1,3} /);
-  const block = info.slice(idx, idx + REACHABILITY_HEADING.length + (end >= 0 ? end : rest.length));
+  const block = info.slice(idx, idx + heading.length + (end >= 0 ? end : rest.length));
   return block.trim() || undefined;
 }
 
@@ -90,8 +100,12 @@ export function extractReachabilityBlock(info: string): string | undefined {
  * "## Threat model" section. With `block` undefined, an existing block is
  * removed. Everything else the user curated is kept as-is.
  */
-export function spliceReachabilityBlock(info: string, block: string | undefined): string {
-  const without = removeSection(info, REACHABILITY_HEADING, /\n#{1,3} /);
+export function spliceReachabilityBlock(
+  info: string,
+  block: string | undefined,
+  heading: string = REACHABILITY_HEADING,
+): string {
+  const without = removeSection(info, heading, /\n#{1,3} /);
   if (!block) return without.endsWith("\n") ? without : `${without}\n`;
   const tm = findHeading(without, "## Threat model");
   if (tm < 0) return `${without.trimEnd()}\n\n${block}\n`;
@@ -192,7 +206,7 @@ function setupDir(projectDataDir: string): string {
 
 /** Breadth-first walk from the root collecting files named `filename`, skipping
  * vendored and hidden trees. */
-function collectFiles(projectRoot: string, filename: string): string[] {
+export function collectFiles(projectRoot: string, filename: string): string[] {
   const found: string[] = [];
   const queue: Array<{ dir: string; depth: number }> = [{ dir: projectRoot, depth: 0 }];
   while (queue.length > 0) {

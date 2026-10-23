@@ -53,6 +53,7 @@ import {
   runOsvEnrich,
   spliceReachabilityBlock,
 } from "./osv-enrich.js";
+import { PACKAGE_ADVISORY_HEADING, runPackageAdvisories } from "./package-advisories.js";
 import { SetupProtocolError } from "./protocol.js";
 import { phaseLabel, type SetupReporter } from "./reporter.js";
 import {
@@ -303,6 +304,21 @@ function readOsvFindings(projectDataDir: string): { count: number; digest: strin
       )
       .sort();
     return { count: parsed.length, digest: digest(keys) };
+  } catch {
+    return { count: 0, digest: "" };
+  }
+}
+
+/** The package's own advisories (newer-release) the lookup persisted: count + digest. */
+function readPackageAdvisories(projectDataDir: string): { count: number; digest: string } {
+  try {
+    const raw = fs.readFileSync(
+      path.join(projectDataDir, "setup", "package-advisories.json"),
+      "utf8",
+    );
+    const parsed = JSON.parse(raw) as { advisories?: Array<{ id?: string; kind?: string }> };
+    const ids = (parsed.advisories ?? []).map((a) => `${a.id}:${a.kind}`).sort();
+    return { count: ids.length, digest: ids.length ? digest(ids) : "" };
   } catch {
     return { count: 0, digest: "" };
   }
@@ -560,6 +576,14 @@ export async function runSetupWorkflow(
       const osvEnrichment = osvEnabled
         ? runOsvEnrich(projectRoot, projectDataDir)
         : { context: "", hits: [] };
+      // The package's own advisories from releases newer than this one, so the
+      // threat model can say whether this codebase is affected by them.
+      const packageAdvisories = osvEnabled
+        ? await runPackageAdvisories(projectRoot, projectDataDir)
+        : { advisories: [], context: "" };
+      const dependencyContext = [osvEnrichment.context, packageAdvisories.context]
+        .filter((part) => part.trim())
+        .join("\n\n");
       analysis = await runPhase(state, reporter, "info", infoInput, () =>
         services.analyze({
           projectId: options.projectId,
@@ -568,7 +592,7 @@ export async function runSetupWorkflow(
           agentConfig,
           signal: workflowSignal,
           onProgress: (progress) => reportAgentProgress(reporter, "info", progress),
-          dependencyContext: osvEnrichment.context,
+          dependencyContext,
         }),
       );
       writeRepositoryAnalysis(projectDataDir, analysis);
@@ -583,14 +607,18 @@ export async function runSetupWorkflow(
       // - osv off → drop stale verdicts so they don't keep steering the scan.
       if (preserveInfo) {
         const curated = mergeInfoWithOsvContext(preserveInfo, "");
-        const freshBlock = osvEnabled
-          ? extractReachabilityBlock(fs.readFileSync(infoPath, "utf8"))
-          : undefined;
-        const merged = osvEnabled
-          ? freshBlock
-            ? spliceReachabilityBlock(curated, freshBlock)
-            : curated
-          : spliceReachabilityBlock(curated, undefined);
+        // Refresh both generated blocks the same way: the dependency verdicts
+        // and the package's own advisory verdicts.
+        const fresh = osvEnabled ? fs.readFileSync(infoPath, "utf8") : "";
+        let merged = curated;
+        for (const heading of [undefined, PACKAGE_ADVISORY_HEADING]) {
+          const freshBlock = osvEnabled ? extractReachabilityBlock(fresh, heading) : undefined;
+          merged = osvEnabled
+            ? freshBlock
+              ? spliceReachabilityBlock(merged, freshBlock, heading)
+              : merged
+            : spliceReachabilityBlock(merged, undefined, heading);
+        }
         atomicWriteFileSync(infoPath, merged);
       }
       state.infoDigest = digest(fs.readFileSync(infoPath, "utf8"));
@@ -699,7 +727,16 @@ export async function runSetupWorkflow(
     const threatModel = fs.existsSync(infoPath) ? fs.readFileSync(infoPath, "utf8") : undefined;
     // Only trust osv-findings.json while osv is enabled: a leftover artifact from
     // an earlier osv run must not keep steering matchers after it's turned off.
-    const osvFindings = osvEnabled ? readOsvFindings(projectDataDir) : { count: 0, digest: "" };
+    const depFindings = osvEnabled ? readOsvFindings(projectDataDir) : { count: 0, digest: "" };
+    const pkgFindings = osvEnabled
+      ? readPackageAdvisories(projectDataDir)
+      : { count: 0, digest: "" };
+    // Both kinds steer matchers at vulnerable code: dependency CVEs and the
+    // package's own advisories from newer releases.
+    const osvFindings = {
+      count: depFindings.count + pkgFindings.count,
+      digest: digest({ dep: depFindings.digest, pkg: pkgFindings.digest }),
+    };
     const dependencyCveCount = osvFindings.count;
     const hasDepCves = dependencyCveCount > 0;
 

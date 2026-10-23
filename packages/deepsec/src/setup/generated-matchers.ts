@@ -49,7 +49,7 @@ export async function proposeGeneratedMatchers(
     hasDepCves && options.threatModel?.trim()
       ? `
 
-This project has known-vulnerable dependencies. In addition to the surface gaps above, propose matchers that flag the *reachable* dependency advisories described in the threat model below. Anchor each to the specific vulnerable call site or condition (for example a form-parsing call made with no size/field limit), so those spots become scan candidates. Skip advisories the threat model marks not-reachable. Set closesSurfaceIds to the surface(s) from the inventory where the vulnerable call occurs (the matcher schema requires at least one); use the closest ingress surface that reaches the call.
+This project has known-vulnerable dependencies and/or advisories for the package itself from newer releases. In addition to the surface gaps above, propose matchers that flag the *reachable* dependency advisories and the package advisories graded LIKELY AFFECTED or CHECK in the threat model below. Anchor each to the specific vulnerable call site or condition (for example a form-parsing call made with no size/field limit), so those spots become scan candidates. Skip advisories the threat model marks not-reachable or LIKELY NOT PRESENT. Set closesSurfaceIds to the surface(s) from the inventory where the vulnerable call occurs (the matcher schema requires at least one); use the closest ingress surface that reaches the call.
 
 Threat model (INFO.md):
 ${options.threatModel.trim()}`
